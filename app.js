@@ -201,9 +201,14 @@ function rankChunks(chunks, question, k = 10, charBudget = 14000) {
 /* ================= engine: heuristics ================= */
 
 const MONTHS = { jan:1,january:1,feb:2,february:2,mar:3,march:3,apr:4,april:4,may:5,jun:6,june:6,jul:7,july:7,aug:8,august:8,sep:9,sept:9,september:9,oct:10,october:10,nov:11,november:11,dec:12,december:12 };
-const MONTH_DATE_RE = /\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s*(\d{4}))?/gi;
+const MONTHPAT = "jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?";
+// "October 8, 2026". The (?!\d) stops "October 2026" being read as day 20.
+const MONTH_DATE_RE = new RegExp(`\\b(${MONTHPAT})\\.?\\s+(\\d{1,2})(?!\\d)(?:st|nd|rd|th)?(?:,?\\s*(\\d{4}))?`, "gi");
+// "8 October 2026", "3rd Nov 2026": the norm outside the US.
+const DAY_MONTH_RE = new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)?\\s+(${MONTHPAT})\\b\\.?,?\\s*(\\d{4})?`, "gi");
 const NUMERIC_DATE_RE = /\b(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?\b/g;
-const TIME_RE = /\b(\d{1,2}):(\d{2})\s*(am|pm)?\b/gi;
+// "11:59 pm", "9:00", and bare "5pm" / "5 p.m."
+const TIME_RE = /\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)|\b(\d{1,2}):(\d{2})\b/gi;
 const EVENT_KEYWORDS = /\b(exam|midterm|prelim|final|quiz|due|deadline|project|paper|presentation|essay|homework|hw|assignment|problem set|pset|lab report|report|test)\b/i;
 
 function classifyKind(text) {
@@ -239,8 +244,11 @@ function extractEventsHeuristic(text) {
     if (!line || !EVENT_KEYWORDS.test(line)) continue;
     const matches = [];
     for (const m of line.matchAll(MONTH_DATE_RE)) matches.push([MONTHS[m[1].toLowerCase()], parseInt(m[2], 10), m[3]]);
+    for (const m of line.matchAll(DAY_MONTH_RE)) matches.push([MONTHS[m[2].toLowerCase()], parseInt(m[1], 10), m[3]]);
     for (const m of line.matchAll(NUMERIC_DATE_RE)) {
-      const mo = parseInt(m[1], 10), da = parseInt(m[2], 10);
+      let mo = parseInt(m[1], 10), da = parseInt(m[2], 10);
+      // 15/03/27 can only be day-first, so read it that way.
+      if (mo > 12 && da >= 1 && da <= 12) { const swap = mo; mo = da; da = swap; }
       if (mo >= 1 && mo <= 12 && da >= 1 && da <= 31) matches.push([mo, da, m[3]]);
     }
     for (const [month, day, ey] of matches) {
@@ -251,15 +259,34 @@ function extractEventsHeuristic(text) {
       const key = iso + "|" + title.toLowerCase().slice(0, 60);
       if (seen.has(key)) continue;
       seen.add(key);
-      const times = Array.from(line.matchAll(TIME_RE));
+      // A range ("7-9pm", "7:30-9:00 pm") means the START time; the meridiem
+      // usually only appears at the end, so borrow it unless the range crosses
+      // noon (11-1pm starts in the morning).
+      const range = line.match(/\b(\d{1,2})(?::(\d{2}))?\s*(?:[-–—]|\bto\b)\s*(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)/i);
+      // TIME_RE has two alternatives; normalize both into {hour, minute, mer}.
+      const times = Array.from(line.matchAll(TIME_RE)).map((t) => ({
+        hour: parseInt(t[1] !== undefined ? t[1] : t[4], 10),
+        minute: parseInt((t[1] !== undefined ? t[2] : t[5]) || "0", 10),
+        mer: (t[3] || "").toLowerCase().replace(/\./g, ""),
+      })).filter((t) => !isNaN(t.hour));
       let time = "";
-      if (times.length) {
+      if (range) {
+        let hour = parseInt(range[1], 10);
+        const minute = parseInt(range[2] || "0", 10);
+        const endHour = parseInt(range[3], 10);
+        const mer = range[5].toLowerCase().replace(/\./g, "");
+        const startShares = hour <= endHour;
+        if (mer === "pm" && startShares && hour < 12) hour += 12;
+        if (mer === "am" && startShares && hour === 12) hour = 0;
+        if (hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59) time = `${pad(hour)}:${pad(minute)}`;
+      } else if (times.length) {
         const tm = times[0];
-        let hour = parseInt(tm[1], 10);
-        const minute = parseInt(tm[2], 10);
-        let mer = (tm[3] || "").toLowerCase();
-        if (!mer && hour <= 11 && times.some((t) => (t[3] || "").toLowerCase() === "pm")) mer = "pm";
+        let hour = tm.hour;
+        const minute = tm.minute;
+        let mer = tm.mer;
+        if (!mer && hour <= 11 && times.some((t) => t.mer === "pm")) mer = "pm";
         if (mer === "pm" && hour < 12) hour += 12;
+        if (mer === "am" && hour === 12) hour = 0;
         if (hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59) time = `${pad(hour)}:${pad(minute)}`;
       }
       events.push({ title, date: iso, time, kind: classifyKind(line) });
@@ -270,6 +297,32 @@ function extractEventsHeuristic(text) {
 
 const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/;
 const PERCENT_LINE_RE = /^(.{2,60}?)[:\s.–—-]*(\d{1,3})\s?%/;
+
+const GRADE_NOISE_RE = /\b(late|loses?|lose|per day|answering|penalt|deduct|reduce[sd]?|miss|total|value|assignment type|up to|each|approximately)\b/i;
+
+function cleanComponent(s) {
+  return String(s).replace(/\s+/g, " ").replace(/^[\s\-:*•–●]+|[\s\-:*•–●]+$/g, "").trim();
+}
+
+function plausibleComponent(s) {
+  return /[a-z]/i.test(s) && s.length >= 2 && s.length <= 45 && !/%/.test(s) && !GRADE_NOISE_RE.test(s);
+}
+
+// PDF tables often extract value-first ("Homework\n20%  Mini Projects\n10% ..."),
+// which reads as gibberish line by line. Splitting into cells and pairing each
+// percentage with the cell before it recovers the real breakdown.
+function gradingFromCells(text) {
+  const cells = text.split(/\n|\s{2,}/).map((s) => s.trim()).filter(Boolean);
+  const out = [];
+  for (let i = 1; i < cells.length && out.length < 12; i++) {
+    const m = cells[i].match(/^(?:up to\s+)?(\d{1,3}(?:\.\d+)?)\s*%/i);
+    if (!m) continue;
+    const name = cleanComponent(cells[i - 1]);
+    if (!plausibleComponent(name)) continue;
+    out.push({ component: name, weight: m[1] + "%" });
+  }
+  return out;
+}
 
 function linesMatching(lines, re, limit = 2) {
   return lines.filter((l) => re.test(l)).map((l) => l.replace(/\s+/g, " ").trim()).slice(0, limit).join(" | ");
@@ -299,12 +352,16 @@ function extractFactsHeuristic(text) {
     }
     const pm = ln.match(PERCENT_LINE_RE);
     if (pm && f.grading.length < 12) {
-      const component = pm[1].replace(/\s+/g, " ").replace(/^[\s\-:*•–]+|[\s\-:*•–]+$/g, "");
-      const noise = /\b(late|loses?|lose|per day|answering|penalt|deduct|reduce[sd]?|miss)\b/i.test(component);
-      if (component.length >= 2 && component.length <= 45 && !noise) {
-        f.grading.push({ component, weight: pm[2] + "%" });
-      }
+      const component = cleanComponent(pm[1]);
+      if (plausibleComponent(component)) f.grading.push({ component, weight: pm[2] + "%" });
     }
+  }
+  // Table-shaped breakdowns win, since a value-first table produces garbage
+  // above; anything the line scan found that the table didn't is appended.
+  const fromCells = gradingFromCells(text);
+  if (fromCells.length >= 2) {
+    const seen = new Set(fromCells.map((g) => g.component.toLowerCase()));
+    f.grading = fromCells.concat(f.grading.filter((g) => !seen.has(g.component.toLowerCase()))).slice(0, 12);
   }
   f.late_policy = linesMatching(lines, /\b(late|slip day|grace period)\b/i, 3);
   f.attendance_policy = linesMatching(lines, /\b(attendance|absence|iclicker|participation required)\b/i, 2);
@@ -350,8 +407,13 @@ function extractAllowancesHeuristic(text) {
   if ((m = text.match(new RegExp(`miss (?:up to )?(${NUMPAT})\\s+(lectures?|classes|tutorials?|labs?|sessions?|discussions?)`, "i")))) {
     add(/tutorial/i.test(m[2]) ? "Tutorial skips" : /lab/i.test(m[2]) ? "Lab skips" : "Class skips", toNum(m[1]));
   }
-  if ((m = text.match(new RegExp(`(${NUMPAT})\\s+(?:unexcused |excused )?absences?(?:\\s+(?:are\\s+)?(?:allowed|permitted))?`, "i")))
-    && /unexcused|excused|allowed|permitted/.test(m[0])) add("Absences", toNum(m[1]));
+  // "3 unexcused absences", "3 absences are allowed", "you are allowed three absences"
+  const GRANT = "allowed|permitted|granted|entitled to|may take|can take|get|have|receive";
+  if ((m = text.match(new RegExp(`(${NUMPAT})\\s+(?:unexcused |excused )?absences?(?:\\s+(?:are\\s+|is\\s+)?(?:${GRANT}))?`, "i")))
+    && /unexcused|excused|allowed|permitted|granted/i.test(m[0])) add("Absences", toNum(m[1]));
+  else if ((m = text.match(new RegExp(`(?:${GRANT})\\s+(?:up to\\s+)?(${NUMPAT})\\s+(?:unexcused |excused )?absences?`, "i")))) {
+    add("Absences", toNum(m[1]));
+  }
   if ((m = text.match(new RegExp(`(${NUMPAT})\\s+free (?:passes|skips|absences)`, "i")))) add("Free passes", toNum(m[1]));
   if ((m = text.match(new RegExp(`(?:get|have|receive|given|allowed)\\s+(${NUMPAT})\\s+(?:free\\s+)?drops\\b`, "i")))) add("Dropped scores", toNum(m[1]));
 
@@ -404,8 +466,8 @@ function extractAllowancesHeuristic(text) {
   // "you can make it up ... twice a term" (newlines allowed; PDFs wrap freely)
   const makeupRe = /make\s+(?:it|them|these|one)\s+up[^.]{0,80}?\b(once|twice|thrice|\d+|one|two|three|four|five)\s*(?:times?)?\s+(?:a|per)\s+(?:term|semester|quarter|year)/gi;
   while ((m = makeupRe.exec(text))) {
-    const line = text.slice(Math.max(0, m.index - 120), m.index + m[0].length);
-    const subs = subjectsInLine(line);
+    const window = text.slice(Math.max(0, m.index - 120), m.index + m[0].length + 120);
+    const subs = subjectsInLine(window);
     add(subs.length === 1 ? `${subs[0]} makeups` : "Makeups", toNum(m[1]));
   }
   return found;
@@ -1315,9 +1377,33 @@ function calendarExcerpt() {
   return { id: 0, label: "Your deadline calendar", doc_id: null, text: lines.join("\n") };
 }
 
+// Words that carry no topic: they say how a question is phrased, not what it
+// is about. Excluded from coverage so "who handles regrades" is judged on
+// "regrades" alone, while "refund policy for parking" still fails on the two
+// content words the materials have never heard of.
+const ASK_WORDS = new Set(["who","whom","whose","which","why","where","should","need","needs","must",
+  "get","gets","got","have","has","had","about","from","than","then","they","them","their","its","our",
+  "us","so","but","not","no","yes","please","tell","know","did","done","was","were","been","being",
+  "would","could","should","may","might","take","takes","go","goes","going","happen","happens","handle",
+  "handles","work","works","use","used","using","many","much","long","often","allowed","am","re","ve"]);
+
+// How much of the question's topic the top passage covers. BM25 scores are
+// corpus-relative, so a short question against a short syllabus can score low
+// while still being an obvious match; coverage catches those.
+function termCoverage(question, text) {
+  const terms = [...new Set(tokenize(question))].filter((t) => !ASK_WORDS.has(t));
+  if (!terms.length) return 0;
+  const hay = " " + tokenize(text).join(" ") + " ";
+  const present = (term) =>
+    hay.includes(" " + term + " ") || (SYNONYMS[term] || []).some((s) => hay.includes(" " + s + " "));
+  return terms.filter(present).length / terms.length;
+}
+
 function heuristicAnswer(question, excerpts) {
   const passages = excerpts.filter((e) => e.id !== 0);
-  const found = passages.length > 0 && (passages[0].score || 0) >= 1.2;
+  const top = passages[0];
+  const found = Boolean(top) &&
+    ((top.score || 0) >= 1.2 || termCoverage(question, top.text) >= 0.5);
   const hasTas = state.db.docs.some((d) => d.facts && d.facts.tas && d.facts.tas.length) ||
     passages.slice(0, 3).some((p) => /\bTAs?\b/.test(p.text));
   const [route, reason] = routeQuestion(question, found, hasTas);
@@ -1505,7 +1591,8 @@ function guessCourseMeta(text, filename) {
     break;
   }
   if (!meta.code && filename) {
-    const m = filename.toUpperCase().match(codeRe);
+    // Separators keep word boundaries from forming: ECE210_outline, cs-225.pdf
+    const m = filename.toUpperCase().replace(/[^A-Z0-9]+/g, " ").match(codeRe);
     if (m && !notCodes.has(m[1])) meta.code = `${m[1]} ${m[2]}`;
   }
   const termM = text.match(/\b(fall|spring|summer|winter)\s*'?(\d{2}|\d{4})\b/i);
@@ -2830,6 +2917,11 @@ function openAddEvent() {
     try {
       await repo.addEvent({ course_id: $("#ne-course").value || null, title, date,
         time: $("#ne-time").value || "", kind: $("#ne-kind").value, source: "manual", details: "" });
+      // Jump to the month the event lands in, otherwise adding a deadline in a
+      // future month looks like nothing happened.
+      const [ey, em] = date.split("-").map(Number);
+      state.calMonth = new Date(ey, em - 1, 1);
+      state.selectedDay = date;
       closeModal(); toast("Event added."); renderCalendar();
     } catch (err) { toast(err.message, "err"); }
   });
