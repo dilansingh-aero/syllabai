@@ -11,6 +11,7 @@
 const $ = (sel, el) => (el || document).querySelector(sel);
 const $$ = (sel, el) => Array.from((el || document).querySelectorAll(sel));
 
+const BUILD = "2026-07-29a";
 const CFG = window.MYSYLLABI_CONFIG || {};
 const REMOTE = Boolean(CFG.supabaseUrl && CFG.supabaseAnonKey && window.supabase);
 const supa = REMOTE ? window.supabase.createClient(CFG.supabaseUrl, CFG.supabaseAnonKey) : null;
@@ -433,32 +434,43 @@ function extractAllowancesHeuristic(text) {
   // Any line pairing "lowest" with "drop" is a drop policy. The subjects come
   // from the whole line, so "Labs will have two lowest scores dropped" is Lab
   // drops, and "Lecture Activities and Homeworks will each have the lowest 2
-  // scores dropped" becomes one tracker per subject.
-  for (const line of text.split(/\r?\n/)) {
+  // scores dropped" becomes one tracker per subject. When the line itself names
+  // nothing, the surrounding context (section heading, neighbouring lines) is
+  // asked before falling back to a vague label.
+  const lines = text.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
     if (!/lowest/i.test(line) || !/drop/i.test(line)) continue;
     const nm = line.match(new RegExp(`(${NUMPAT})\\s+lowest`, "i"))
       || line.match(new RegExp(`lowest\\s+(${NUMPAT})`, "i"));
     const total = nm ? toNum(nm[1]) : 1;
-    const subs = subjectsInLine(line);
+    const subs = subjectsInLine(line).length ? subjectsInLine(line) : contextSubjects(lines, i);
     if (subs.length) for (const s of subs) add(`${s} drops`, total);
     else add("Dropped scores", total);
   }
 
   // "(2 drops)" tucked inside a grading line: name it from the component,
   // e.g. "Homework Assignments (approximately 11; 1 drop): 55%".
-  for (const line of text.split(/\r?\n/)) {
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
     let lm;
     const inline = new RegExp(`\\b(${NUMPAT})\\s+drops?\\b`, "gi");
+    // A row that opens with its percentage ("20% (1 drop)  Quizzes") belongs to
+    // the component named ABOVE it; the trailing name starts the next row.
+    const valueFirst = /^\s*(?:up to\s+)?\d{1,3}(?:\.\d+)?\s*%/.test(line);
     while ((lm = inline.exec(line))) {
-      const subs = subjectsInLine(line);
-      const comp = line.match(/^(.{2,60}?)\s*[(:]/);
+      const subs = valueFirst ? [] : subjectsInLine(line);
+      const comp = valueFirst ? null : line.match(/^(.{2,60}?)\s*[(:]/);
       let label;
       if (subs.length === 1) label = `${subs[0]} drops`;
-      else if (comp) {
-        const cs = subjectsInLine(comp[1]);
-        label = `${cs.length ? cs[0] : comp[1].trim().replace(/\s+/g, " ").slice(0, 22)} drops`;
-      } else if (subs.length) label = `${subs[0]} drops`;
-      else label = "Dropped scores";
+      else if (comp && subjectsInLine(comp[1]).length) label = `${subjectsInLine(comp[1])[0]} drops`;
+      else if (subs.length) label = `${subs[0]} drops`;
+      else {
+        const ctx = valueFirst ? subjectsBefore(lines, i) : contextSubjects(lines, i);
+        if (ctx.length) label = `${ctx[0]} drops`;
+        else if (comp && plausibleComponent(cleanComponent(comp[1]))) label = `${cleanComponent(comp[1]).slice(0, 22)} drops`;
+        else label = "Dropped scores";
+      }
       add(label, toNum(lm[1]));
     }
   }
@@ -482,6 +494,37 @@ const SUBJ_WORDS = [
   ["lecture", "Lecture"], ["participation", "Participation"], ["attendance", "Attendance"],
 ];
 
+// When a drop policy names no subject ("the lowest 2 scores are dropped"),
+// look outward: the line above, the line below, then the nearest heading-like
+// line above. A specific label beats a vague one every time.
+// Searching strictly upward, used for table rows whose own line starts with a
+// value: the name that owns it was printed before it.
+function subjectsBefore(lines, i) {
+  for (let j = i - 1; j >= 0 && j >= i - 6; j--) {
+    const cells = String(lines[j] || "").split(/\s{2,}/).reverse();
+    for (const cell of cells) {
+      const subs = subjectsInLine(cell);
+      if (subs.length === 1) return subs;
+    }
+  }
+  return [];
+}
+
+function contextSubjects(lines, i) {
+  const near = [lines[i - 1], lines[i + 1]].filter(Boolean);
+  for (const line of near) {
+    const subs = subjectsInLine(line);
+    if (subs.length === 1) return subs;
+  }
+  for (let j = i - 1; j >= 0 && j >= i - 12; j--) {
+    const line = (lines[j] || "").trim();
+    if (!line || line.length > 60) continue;
+    const subs = subjectsInLine(line);
+    if (subs.length === 1) return subs;
+  }
+  return [];
+}
+
 function subjectsInLine(line) {
   const l = line.toLowerCase();
   const found = [];
@@ -493,6 +536,8 @@ function subjectsInLine(line) {
   return found;
 }
 
+const VAGUE_LABEL_RE = /^(dropped scores?|drops?|drop|skips?|allowances?|makeups?)$/i;
+
 function mergeAllowances(course, found) {
   course.allowances = course.allowances || [];
   const existing = new Set(course.allowances.map((a) => a.label.toLowerCase().trim()));
@@ -501,6 +546,20 @@ function mergeAllowances(course, found) {
     const label = String(f.label || "").slice(0, 30).trim();
     const total = Math.max(1, Math.min(99, parseInt(f.total, 10) || 0));
     if (!label || !f.total || existing.has(label.toLowerCase())) continue;
+    // A specific finding replaces a vague placeholder of the same size rather
+    // than sitting next to it ("Dropped scores 2" -> "Homework drops 2"),
+    // keeping however many the student has already used.
+    const vague = VAGUE_LABEL_RE.test(label) ? -1
+      : course.allowances.findIndex((a) => VAGUE_LABEL_RE.test(a.label) && a.total === total);
+    if (vague >= 0) {
+      const old = course.allowances[vague];
+      existing.delete(old.label.toLowerCase());
+      existing.add(label.toLowerCase());
+      course.allowances[vague] = { label, emoji: labelEmoji(label), total,
+        remaining: Math.min(old.remaining, total) };
+      added++;
+      continue;
+    }
     existing.add(label.toLowerCase());
     course.allowances.push({ label, emoji: labelEmoji(label), total, remaining: total });
     added++;
@@ -2122,13 +2181,14 @@ function renderCourse(courseId) {
     btn.disabled = true;
     try {
       const { added, aiOk, hadText } = await autoDetectSkips(c);
+      const have = (c.allowances || []).length;
+      const who = aiOk ? "AI read everything and" : "Scan";
       if (!hadText) toast("Nothing to scan yet. Upload a syllabus or add a note first.", "err");
-      else if (aiOk) toast(added ? `AI read everything and set up ${added} tracker${added === 1 ? "" : "s"}.`
-        : "AI read everything: no countable skips, drops, or allowances stated.");
-      else if (REMOTE) toast(added ? `Basic scan found ${added} tracker${added === 1 ? "" : "s"}. The full AI scan needs the updated edge function deployed (SETUP.md).`
-        : "Basic scan found nothing. The full AI scan (handles typos and any wording) needs the updated edge function deployed, or you're out of AI calls today.", added ? "" : "err");
-      else toast(added ? `Found ${added} tracker${added === 1 ? "" : "s"}.`
-        : "No countable skips or drops matched. Demo mode uses patterns only; the live site's AI scan reads anything.");
+      else if (added) toast(`${who} set up ${added} tracker${added === 1 ? "" : "s"}.`);
+      else if (have) toast(`Already up to date: your ${have} tracker${have === 1 ? "" : "s"} match your materials.`);
+      else if (aiOk) toast("AI read everything: this course states no countable skips, drops, or allowances.");
+      else toast("No countable skips or drops stated in your materials." +
+        (REMOTE ? " (The AI scan, which handles typos and unusual wording, needs the updated edge function deployed.)" : ""));
     } catch (err) { toast(err.message, "err"); }
     renderCourse(courseId);
   });
@@ -2979,6 +3039,11 @@ function renderSettings() {
             <button class="btn" id="clear-history">Clear Q&A history</button>
             <button class="btn danger" id="wipe">Erase everything</button>
           </div>`}
+      </div>
+      <div class="card">
+        <h3>ℹ️ Version</h3>
+        <div class="kv"><span class="k">Build</span><span>${esc(BUILD)}</span></div>
+        <p class="muted" style="font-size:12.5px">If a new feature seems missing, check this against what you were told shipped, then reload with Ctrl+Shift+R.</p>
       </div>
       <div class="card">
         <h3>🗓 Calendar data</h3>
