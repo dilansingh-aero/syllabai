@@ -12,9 +12,14 @@
 
 import { createClient } from "npm:@supabase/supabase-js@2";
 
+// Model lineup, tuned for what each job needs:
+//   MODEL       document extraction. Dates and policies must be right and it
+//               only runs once per upload, so the strongest model.
+//   FAST_MODEL  chat answers and email drafts. Much faster than Opus, near
+//               the same quality for short grounded answers with quotes.
+//   CHEAP_MODEL the skips scan. Narrow job, cheapest model.
 const MODEL = "claude-opus-5";
-// Cheap model for narrow extraction jobs (the skips scan). Answer quality for
-// real Q&A stays on MODEL above.
+const FAST_MODEL = "claude-sonnet-5";
 const CHEAP_MODEL = "claude-haiku-4-5";
 const LIMIT = parseInt(Deno.env.get("MYSYLLABI_DAILY_LIMIT") ?? "25", 10);
 const API_KEY = Deno.env.get("ANTHROPIC_API_KEY") ?? "";
@@ -163,7 +168,7 @@ async function callClaude(system: string, user: string, maxTokens: number, effor
   // effort is only sent to models that support it; the cheap model gets the
   // schema constraint alone.
   const outputConfig: Record<string, unknown> = { format: { type: "json_schema", schema } };
-  if (model === MODEL) outputConfig.effort = effort;
+  if (model !== CHEAP_MODEL) outputConfig.effort = effort;
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -247,8 +252,10 @@ Deno.serve(async (req) => {
   if (!API_KEY) return json({ limited: true, reason: "no_key", usage });
   if (used >= LIMIT) return json({ limited: true, reason: "limit", usage });
 
-  // Consume one call up front.
-  await admin.from("ai_usage").upsert({ user_id: userId, day: today, calls: used + 1 });
+  // Consume one call up front. Started eagerly and awaited before responding,
+  // so the database round trip overlaps the AI call instead of preceding it.
+  const charge = admin.from("ai_usage")
+    .upsert({ user_id: userId, day: today, calls: used + 1 }).then((r) => r);
   usage.used = used + 1;
   usage.left = Math.max(0, LIMIT - usage.used);
 
@@ -258,7 +265,7 @@ Deno.serve(async (req) => {
       const question = String(body.question || "").slice(0, 2000);
       const scope = String(body.scope || "all of the student's courses").slice(0, 200);
       const history = (body.history as { q: string; a: string }[] | undefined) ?? [];
-      if (!question || !excerpts.length) return json({ error: "Missing question or excerpts." }, 400);
+      if (!question || !excerpts.length) { await charge; return json({ error: "Missing question or excerpts." }, 400); }
       let prompt = "EXCERPTS FROM THE STUDENT'S MATERIALS:\n\n" +
         excerpts.slice(0, 14).map((ex) => `[${ex.id}] ${ex.label}\n${String(ex.text).slice(0, 4000)}`).join("\n\n---\n\n");
       if (history.length) {
@@ -267,7 +274,8 @@ Deno.serve(async (req) => {
       }
       prompt += `\n\nSCOPE: ${scope}\nSTUDENT'S QUESTION: ${question}`;
       const result = await callClaude(
-        QA_SYSTEM.replace("{today}", new Date().toDateString()), prompt, 6000, "medium", ANSWER_SCHEMA);
+        QA_SYSTEM.replace("{today}", new Date().toDateString()), prompt, 3500, "medium", ANSWER_SCHEMA, FAST_MODEL);
+      await charge;
       return json({ result, usage });
     }
 
@@ -279,6 +287,7 @@ Deno.serve(async (req) => {
       const result = await callClaude(
         FACTS_SYSTEM.replace("{today}", today).replace("{term}", term),
         `SYLLABUS for ${code}:\n\n${text}`, 12000, "medium", FACTS_SCHEMA);
+      await charge;
       return json({ result, usage });
     }
 
@@ -290,6 +299,7 @@ Deno.serve(async (req) => {
         SKIPS_SYSTEM,
         `ALL MATERIALS AND NOTES for ${code}:\n\n${text}`,
         2000, "medium", SKIPS_SCHEMA, CHEAP_MODEL);
+      await charge;
       return json({ result, usage });
     }
 
@@ -302,12 +312,15 @@ Deno.serve(async (req) => {
       const result = await callClaude(
         EMAIL_SYSTEM,
         `Student: ${student}\nCourse: ${code}\nRecipient type: ${recipient}\nWhat they want to ask about: ${question}\n\nRelevant material from their syllabus/answer:\n${context}`,
-        3000, "low", EMAIL_SCHEMA);
+        3000, "low", EMAIL_SCHEMA, FAST_MODEL);
+      await charge;
       return json({ result, usage });
     }
 
+    await charge;
     return json({ error: "Unknown kind." }, 400);
   } catch (e) {
+    await charge.catch(() => {});
     const message = e instanceof Error ? e.message : String(e);
     if (message === "refusal") return json({ error: "The AI declined this request.", usage }, 200);
     return json({ error: `AI call failed: ${message.slice(0, 200)}`, usage }, 200);
