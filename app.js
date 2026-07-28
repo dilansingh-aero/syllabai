@@ -529,13 +529,31 @@ async function extractFile(file) {
     const result = await mammoth.extractRawText({ arrayBuffer: await file.arrayBuffer() });
     return { text: result.value, kind: "docx" };
   }
+  if (name.endsWith(".html") || name.endsWith(".htm")) {
+    const text = htmlToText(await file.text());
+    if (text.length < 40) throw new Error("That page has no readable text.");
+    return { text, kind: "html" };
+  }
   if (name.endsWith(".txt") || name.endsWith(".md")) {
     return { text: await file.text(), kind: "txt" };
   }
-  throw new Error("Unsupported file type. Upload a .pdf, .docx, .txt, or .md file.");
+  throw new Error("Unsupported file type. Upload a .pdf, .docx, .html, .txt, or .md file.");
 }
 
-const UPLOADABLE_RE = /\.(pdf|docx|txt|md)$/i;
+// Saved webpages (common for NZ course outlines) become plain text with the
+// block structure kept as line breaks, so headings and tables survive.
+function htmlToText(html) {
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  doc.querySelectorAll("script, style, noscript, iframe, svg").forEach((el) => el.remove());
+  doc.querySelectorAll("br").forEach((el) => el.replaceWith("\n"));
+  doc.querySelectorAll("td, th").forEach((el) => el.append("  "));
+  doc.querySelectorAll("p, div, li, tr, h1, h2, h3, h4, h5, h6, table, section, article, dt, dd")
+    .forEach((el) => el.append("\n"));
+  const text = (doc.body ? doc.body.textContent : doc.textContent) || "";
+  return text.replace(/\u00A0/g, " ").replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+const UPLOADABLE_RE = /\.(pdf|docx|txt|md|html?)$/i;
 
 // Turn a drop into a flat file list, walking folders (course-outline packs).
 // Entries must be grabbed before the first await or the DataTransfer goes stale.
@@ -1417,8 +1435,8 @@ function openAddCourse() {
     <div class="field"><label>Color</label>${colorSelectHtml("ac-color", startColor)}</div>
     <div class="dropzone" id="ac-drop">
       <b>Drop files or a whole course folder here</b><br>
-      or <a id="ac-browse">browse files</a> · <a id="ac-folder-link">choose a folder</a> — PDF, Word, or text
-      <input type="file" id="ac-file" accept=".pdf,.docx,.txt,.md" multiple style="display:none">
+      or <a id="ac-browse">browse files</a> · <a id="ac-folder-link">choose a folder</a> — PDF, Word, HTML, or text
+      <input type="file" id="ac-file" accept=".pdf,.docx,.txt,.md,.html,.htm" multiple style="display:none">
       <input type="file" id="ac-folder" webkitdirectory style="display:none">
     </div>
     ${REMOTE ? `
@@ -1863,16 +1881,16 @@ function renderCourse(courseId) {
     <div class="card">
       ${docs.map((d) => `
         <div class="doc-row doc-open" data-doc="${d.id}" title="Click to open">
-          <span>${d.kind === "pdf" ? "📕" : d.kind === "docx" ? "📘" : "📄"}</span>
+          <span>${d.kind === "pdf" ? "📕" : d.kind === "docx" ? "📘" : d.kind === "html" ? "🌐" : "📄"}</span>
           <div><div class="name">${esc(d.filename)}</div>
           <div class="meta">${esc(d.kind)} · added ${esc((d.uploaded_at || "").slice(0, 10))} · click to open</div></div>
           <div class="spacer"></div>
           <button class="btn small danger" data-del-doc="${d.id}">Remove</button>
         </div>`).join("") || `<p class="muted" style="margin:4px">No documents yet.</p>`}
       <div class="dropzone" id="dropzone">
-        <b>Drop syllabus, course outline, or any course files here</b> or <a id="browse">browse</a> — PDF, Word, or text. Folders and multiple files work.<br>
+        <b>Drop syllabus, course outline, or any course files here</b> or <a id="browse">browse</a> — PDF, Word, HTML, or text. Folders and multiple files work.<br>
         <span style="font-size:12.5px">Deadlines are auto-added to your calendar; key policies fill the course info.</span>
-        <input type="file" id="file-input" accept=".pdf,.docx,.txt,.md" multiple style="display:none">
+        <input type="file" id="file-input" accept=".pdf,.docx,.txt,.md,.html,.htm" multiple style="display:none">
       </div>
     </div>
 
