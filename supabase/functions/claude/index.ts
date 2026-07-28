@@ -128,7 +128,11 @@ const FACTS_SCHEMA = {
 
 const SKIPS_SYSTEM = `You hunt through a student's course materials for every countable per-semester allowance the course grants them. Think carefully and read everything: syllabi, course outlines, policies, and the student's own notes about what the professor said.
 
-An allowance is ANY finite, numbered budget of forgiveness, of ANY kind, under ANY name. Dropped lowest scores, permitted absences or misses (lectures, labs, tutorials, discussions, iClicker, attendance), slip or grace or late days, free passes, token systems, revision or resubmission chances, excused skips, anything of that shape. These are examples, not a list to match against: there is no fixed vocabulary. If the materials grant a countable number of anything forgivable, include it, whatever it's called.
+An allowance is ANY finite, numbered budget of forgiveness, of ANY kind, under ANY name. Dropped lowest scores, permitted absences or misses (lectures, labs, tutorials, discussions, iClicker, attendance), slip or grace or late days, free passes, token systems, revision or resubmission chances, makeup chances ("you can make it up twice a term" is total 2), excused skips, anything of that shape. These are examples, not a list to match against: there is no fixed vocabulary. If the materials grant a countable number of anything forgivable, include it, whatever it's called.
+
+Be SPECIFIC in labels. "The Lecture Activities and Homeworks will each have the lowest 2 scores dropped" is TWO entries: Lecture activity drops (2) and Homework drops (2). "Labs will have two lowest scores dropped" is Lab drops (2). Never emit a vague label like "Dropped scores" when the materials say what is being dropped. If the materials contradict themselves, prefer the most specific, most recent-sounding statement.
+
+Allowances hide inside grading tables too. "Homework Assignments (approximately 11; 1 drop): 55%" grants Homework drops (1). "Attendance and In-Class Exercises (minimum one file per lecture, 2 drops): 10%" grants Attendance drops (2). Read every parenthetical and every table row; a single word like "1 drop" buried mid-line still counts. Missing a stated allowance is the worst failure mode; scan the ENTIRE text before answering.
 
 The student's notes are informal. Handle typos, shorthand, and odd wording: "5 homewokr skips" means Homework skips 5, "prof said 2 iclicker drops" means iClicker drops 2, "can miss 3 tutes" means Tutorial skips 3. Read for meaning, not exact words.
 

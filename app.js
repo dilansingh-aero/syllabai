@@ -317,7 +317,7 @@ function extractFactsHeuristic(text) {
 
 /* ---- allowance (skips/drops) detection ---- */
 
-const WORDNUM = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10 };
+const WORDNUM = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10, once: 1, twice: 2, thrice: 3 };
 function toNum(s) { return WORDNUM[String(s).toLowerCase()] || parseInt(s, 10) || 0; }
 const NUMPAT = "\\d+|one|two|three|four|five|six|seven|eight|nine|ten";
 const SUBJPAT = "homework|hw|assignment|problem set|pset|quiz(?:zes)?|quiz|lab|tutorial|reading|discussion";
@@ -364,18 +364,69 @@ function extractAllowancesHeuristic(text) {
   const colonDropRe = new RegExp(`(${SUBJPAT})\\s+(drops?|skips?|passes)\\s*[:=-]\\s*(${NUMPAT})\\b`, "gi");
   while ((m = colonDropRe.exec(text))) add(`${normSubject(m[1])} ${nounOf(m[2])}`, toNum(m[3]));
 
-  // "drop the two lowest quiz scores", "we drop your lowest homework grade"
-  const dropLowRe = new RegExp(`drop(?:s|ped)?\\s+(?:the\\s+|your\\s+)?(${NUMPAT})?\\s*lowest\\s+(${SUBJPAT})?`, "gi");
-  while ((m = dropLowRe.exec(text))) {
-    const subject = m[2] ? normSubject(m[2]) : "";
-    add(subject ? `${subject} drops` : "Dropped scores", m[1] ? toNum(m[1]) : 1);
+  // "we drop two labs from the final score"
+  const dropNSubjRe = new RegExp(`drops?\\s+(?:the\\s+|your\\s+)?(${NUMPAT})\\s+(?:lowest\\s+)?(${SUBJPAT})`, "gi");
+  while ((m = dropNSubjRe.exec(text))) add(`${normSubject(m[2])} drops`, toNum(m[1]));
+
+  // Any line pairing "lowest" with "drop" is a drop policy. The subjects come
+  // from the whole line, so "Labs will have two lowest scores dropped" is Lab
+  // drops, and "Lecture Activities and Homeworks will each have the lowest 2
+  // scores dropped" becomes one tracker per subject.
+  for (const line of text.split(/\r?\n/)) {
+    if (!/lowest/i.test(line) || !/drop/i.test(line)) continue;
+    const nm = line.match(new RegExp(`(${NUMPAT})\\s+lowest`, "i"))
+      || line.match(new RegExp(`lowest\\s+(${NUMPAT})`, "i"));
+    const total = nm ? toNum(nm[1]) : 1;
+    const subs = subjectsInLine(line);
+    if (subs.length) for (const s of subs) add(`${s} drops`, total);
+    else add("Dropped scores", total);
   }
 
-  // "two lowest homework scores are dropped"
-  const lowDropRe = new RegExp(`(?:(${NUMPAT})\\s+)?lowest\\s+(${SUBJPAT})?\\s*(?:scores?|grades?|marks?)?\\s*(?:is|are|will be)?\\s*dropped`, "gi");
-  while ((m = lowDropRe.exec(text))) {
-    const subject = m[2] ? normSubject(m[2]) : "";
-    add(subject ? `${subject} drops` : "Dropped scores", m[1] ? toNum(m[1]) : 1);
+  // "(2 drops)" tucked inside a grading line: name it from the component,
+  // e.g. "Homework Assignments (approximately 11; 1 drop): 55%".
+  for (const line of text.split(/\r?\n/)) {
+    let lm;
+    const inline = new RegExp(`\\b(${NUMPAT})\\s+drops?\\b`, "gi");
+    while ((lm = inline.exec(line))) {
+      const subs = subjectsInLine(line);
+      const comp = line.match(/^(.{2,60}?)\s*[(:]/);
+      let label;
+      if (subs.length === 1) label = `${subs[0]} drops`;
+      else if (comp) {
+        const cs = subjectsInLine(comp[1]);
+        label = `${cs.length ? cs[0] : comp[1].trim().replace(/\s+/g, " ").slice(0, 22)} drops`;
+      } else if (subs.length) label = `${subs[0]} drops`;
+      else label = "Dropped scores";
+      add(label, toNum(lm[1]));
+    }
+  }
+
+  // "you can make it up ... twice a term" (newlines allowed; PDFs wrap freely)
+  const makeupRe = /make\s+(?:it|them|these|one)\s+up[^.]{0,80}?\b(once|twice|thrice|\d+|one|two|three|four|five)\s*(?:times?)?\s+(?:a|per)\s+(?:term|semester|quarter|year)/gi;
+  while ((m = makeupRe.exec(text))) {
+    const line = text.slice(Math.max(0, m.index - 120), m.index + m[0].length);
+    const subs = subjectsInLine(line);
+    add(subs.length === 1 ? `${subs[0]} makeups` : "Makeups", toNum(m[1]));
+  }
+  return found;
+}
+
+// Subjects mentioned anywhere in a policy line, most specific first.
+const SUBJ_WORDS = [
+  ["lecture activit", "Lecture activity"], ["iclicker", "iClicker"], ["clicker", "Clicker"],
+  ["homework", "Homework"], ["problem set", "Problem set"], ["pset", "Problem set"],
+  ["assignment", "Assignment"], ["quiz", "Quiz"], ["lab", "Lab"], ["tutorial", "Tutorial"],
+  ["discussion", "Discussion"], ["reading", "Reading"], ["project", "Project"],
+  ["lecture", "Lecture"], ["participation", "Participation"], ["attendance", "Attendance"],
+];
+
+function subjectsInLine(line) {
+  const l = line.toLowerCase();
+  const found = [];
+  for (const [key, label] of SUBJ_WORDS) {
+    if (!l.includes(key)) continue;
+    if (found.some((f) => f.startsWith(label) || label.startsWith(f))) continue;
+    found.push(label);
   }
   return found;
 }
@@ -683,7 +734,15 @@ function localLoad() {
   return { courses: [], docs: [], events: [], notes: [], sessions: [], chats: [] };
 }
 let localDb = REMOTE ? null : localLoad();
-function localSave() { localStorage.setItem(LOCAL_KEY, JSON.stringify(localDb)); }
+// state.db is the source of truth; repo methods reassign its arrays, so sync
+// them back into localDb before writing (chats live only in localDb).
+function localSave() {
+  if (state.db.courses !== undefined) {
+    localDb = { ...localDb, courses: state.db.courses, docs: state.db.docs,
+      events: state.db.events, notes: state.db.notes, sessions: state.db.sessions };
+  }
+  localStorage.setItem(LOCAL_KEY, JSON.stringify(localDb));
+}
 
 async function sbThrow(promise) {
   const { data, error } = await promise;
@@ -1431,7 +1490,7 @@ function renderDashboard() {
 // Best guess at course code / title / term / instructor from the first lines
 // of a syllabus, so a dropped file can become a fully-named course.
 function guessCourseMeta(text, filename) {
-  const head = text.split(/\r?\n/).slice(0, 40).map((l) => l.trim()).filter(Boolean);
+  const head = text.split(/\r?\n/).slice(0, 60).map((l) => l.trim()).filter(Boolean);
   const meta = { code: "", title: "", term: "", instructor: "" };
   const codeRe = /\b([A-Z]{2,5})\s?-?\s?(\d{3,4}[A-Z]?)\b/;
   const notCodes = new Set(["FALL", "SPRING", "SUMMER", "WINTER", "ROOM", "HALL", "SUITE", "PHONE"]);
@@ -1452,8 +1511,12 @@ function guessCourseMeta(text, filename) {
   const termM = text.match(/\b(fall|spring|summer|winter)\s*'?(\d{2}|\d{4})\b/i);
   if (termM) meta.term = `${cap(termM[1].toLowerCase())} ${termM[2].length === 2 ? "20" + termM[2] : termM[2]}`;
   for (const l of head) {
-    const im = l.match(/^(?:instructor|professor|taught by)\s*:?\s*(.{3,})$/i);
-    if (im) { meta.instructor = im[1].replace(EMAIL_RE, "").replace(/[()]/g, "").trim().slice(0, 80); break; }
+    const tm = l.match(/course title\s*:?\s*(.{3,90})/i);
+    if (tm) { meta.title = tm[1].replace(/[●•·|]+.*$/, "").trim().slice(0, 120); break; }
+  }
+  for (const l of head) {
+    const im = l.match(/^(?:instructor|professor|taught by)s?\s*:?\s*(.{3,})$/i);
+    if (im) { meta.instructor = im[1].replace(EMAIL_RE, "").replace(/[()]/g, "").replace(/[●•·|]+.*$/, "").trim().slice(0, 80); break; }
   }
   return meta;
 }
@@ -2039,14 +2102,15 @@ async function autoDetectSkips(course) {
   let found = extractAllowancesHeuristic(combined);
   // Signed in with AI: a dedicated cheap-model pass reads the same pile with an
   // open-ended brief (any countable allowance, any wording, typos included).
-  // Its results lead; the pattern scan is only the offline backup.
+  // When it works, its answer REPLACES the pattern scan entirely, so vague
+  // pattern labels never sit next to the AI's specific ones.
   let aiOk = false;
   if (REMOTE && state.user && texts.length) {
     try {
       const res = await repo.invokeClaude({ kind: "skips",
         text: combined.slice(0, 80000), code: course.code });
       if (res && res.result && Array.isArray(res.result.allowances)) {
-        found = res.result.allowances.concat(found);
+        found = res.result.allowances;
         aiOk = true;
       }
     } catch (_e) { /* out of AI calls or older function: heuristic already ran */ }
