@@ -534,10 +534,41 @@ async function extractFile(file) {
     if (text.length < 40) throw new Error("That page has no readable text.");
     return { text, kind: "html" };
   }
+  if (name.endsWith(".mhtml") || name.endsWith(".mht")) {
+    // Chrome's default "Webpage, Single File" save format.
+    const html = mhtmlToHtml(await file.text());
+    const text = html ? htmlToText(html) : "";
+    if (text.length < 40) throw new Error("Couldn't read that saved page. Re-save it as 'Webpage, HTML Only' and try again.");
+    return { text, kind: "html" };
+  }
   if (name.endsWith(".txt") || name.endsWith(".md")) {
     return { text: await file.text(), kind: "txt" };
   }
   throw new Error("Unsupported file type. Upload a .pdf, .docx, .html, .txt, or .md file.");
+}
+
+// Pull the html part out of an MHTML (MIME) package.
+function mhtmlToHtml(raw) {
+  const htmlAt = raw.search(/content-type:\s*text\/html/i);
+  if (htmlAt < 0) return null;
+  let headEnd = raw.indexOf("\r\n\r\n", htmlAt);
+  if (headEnd < 0) headEnd = raw.indexOf("\n\n", htmlAt);
+  if (headEnd < 0) return null;
+  const head = raw.slice(htmlAt, headEnd);
+  let body = raw.slice(headEnd).trim();
+  const bm = raw.match(/boundary="?([^"\r\n]+)"?/i);
+  if (bm) {
+    const cut = body.indexOf("--" + bm[1]);
+    if (cut > 0) body = body.slice(0, cut);
+  }
+  if (/content-transfer-encoding:\s*base64/i.test(head)) {
+    try { return atob(body.replace(/\s+/g, "")); } catch (_e) { return null; }
+  }
+  if (/content-transfer-encoding:\s*quoted-printable/i.test(head)) {
+    return body.replace(/=\r?\n/g, "")
+      .replace(/=([0-9A-F]{2})/gi, (_m, h) => String.fromCharCode(parseInt(h, 16)));
+  }
+  return body;
 }
 
 // Saved webpages (common for NZ course outlines) become plain text with the
@@ -553,7 +584,7 @@ function htmlToText(html) {
   return text.replace(/\u00A0/g, " ").replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
-const UPLOADABLE_RE = /\.(pdf|docx|txt|md|html?)$/i;
+const UPLOADABLE_RE = /\.(pdf|docx|txt|md|html?|mht(?:ml)?)$/i;
 
 // Turn a drop into a flat file list, walking folders (course-outline packs).
 // Entries must be grabbed before the first await or the DataTransfer goes stale.
@@ -1436,7 +1467,7 @@ function openAddCourse() {
     <div class="dropzone" id="ac-drop">
       <b>Drop files or a whole course folder here</b><br>
       or <a id="ac-browse">browse files</a> · <a id="ac-folder-link">choose a folder</a> — PDF, Word, HTML, or text
-      <input type="file" id="ac-file" accept=".pdf,.docx,.txt,.md,.html,.htm" multiple style="display:none">
+      <input type="file" id="ac-file" accept=".pdf,.docx,.txt,.md,.html,.htm,.mhtml,.mht" multiple style="display:none">
       <input type="file" id="ac-folder" webkitdirectory style="display:none">
     </div>
     ${REMOTE ? `
@@ -1890,7 +1921,7 @@ function renderCourse(courseId) {
       <div class="dropzone" id="dropzone">
         <b>Drop syllabus, course outline, or any course files here</b> or <a id="browse">browse</a> — PDF, Word, HTML, or text. Folders and multiple files work.<br>
         <span style="font-size:12.5px">Deadlines are auto-added to your calendar; key policies fill the course info.</span>
-        <input type="file" id="file-input" accept=".pdf,.docx,.txt,.md,.html,.htm" multiple style="display:none">
+        <input type="file" id="file-input" accept=".pdf,.docx,.txt,.md,.html,.htm,.mhtml,.mht" multiple style="display:none">
       </div>
     </div>
 
