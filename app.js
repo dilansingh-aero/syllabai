@@ -1,36 +1,32 @@
-/* MySyllabi — browser edition (GitHub Pages friendly).
+/* MySyllabi — GitHub Pages frontend backed by Supabase.
  *
- * Everything runs and stays in THIS browser: courses, syllabi, calendar, Q&A
- * history (localStorage). No server, no shared accounts. With an Anthropic API
- * key (Settings) answers come from claude-opus-5, restricted to your uploads;
- * without one, a keyword-retrieval fallback shows best-matching passages.
+ * Two modes, decided by config.js:
+ *   remote: Supabase accounts + Postgres storage. AI answers come from the
+ *           "claude" edge function, which holds the server's Anthropic key and
+ *           enforces a per-user daily limit. Clients never see a key.
+ *   local:  no config yet -> in-browser demo (localStorage, keyword answers).
  */
 "use strict";
 
 const $ = (sel, el) => (el || document).querySelector(sel);
 const $$ = (sel, el) => Array.from((el || document).querySelectorAll(sel));
 
-/* ================= persistence ================= */
+const CFG = window.MYSYLLABI_CONFIG || {};
+const REMOTE = Boolean(CFG.supabaseUrl && CFG.supabaseAnonKey && window.supabase);
+const supa = REMOTE ? window.supabase.createClient(CFG.supabaseUrl, CFG.supabaseAnonKey) : null;
 
-const DB_KEY = "mysyllabi-v1";
-
-function freshDb() {
-  return { courses: [], docs: [], events: [], chats: [], apiKey: "", nextId: 1, welcomed: false };
-}
-let db = loadDb();
-
-function loadDb() {
-  try {
-    const raw = localStorage.getItem(DB_KEY);
-    if (raw) return { ...freshDb(), ...JSON.parse(raw) };
-  } catch (_e) { /* corrupted -> start fresh */ }
-  return freshDb();
-}
-function save() { localStorage.setItem(DB_KEY, JSON.stringify(db)); }
-function uid() { return db.nextId++; }
-
-const MODEL = "claude-opus-5";
 const COURSE_COLORS = ["#4f46e5", "#0d9488", "#d97706", "#db2777", "#7c3aed", "#059669", "#dc2626", "#2563eb"];
+const KIND_ICONS = { exam: "📝", quiz: "❓", assignment: "📌", project: "📦", class: "🏫", other: "📅" };
+const ALLOW_EMOJI = { "Class skips": "🏫", "Homework skips": "📌", "Lab skips": "🧪" };
+const SESSION_GAP_MS = 30 * 60 * 1000;
+
+const state = {
+  user: null,                    // {id, email, name}
+  usage: { on: false, limit: 0, used: 0, left: 0 },
+  db: { courses: [], docs: [], events: [], notes: [], sessions: [] },
+  askCourse: "", calMonth: null, selectedDay: null,
+  viewingSessionId: null, currentSessionId: null, msgs: [],
+};
 
 /* ================= small utils ================= */
 
@@ -46,11 +42,14 @@ function toast(msg, kind) {
   $("#toasts").appendChild(el);
   setTimeout(() => el.remove(), 4500);
 }
-function openModal(html) { $("#modal").innerHTML = html; $("#modal-backdrop").classList.remove("hidden"); }
+function openModal(html, wide) {
+  const modal = $("#modal");
+  modal.classList.toggle("wide", Boolean(wide));
+  modal.innerHTML = html;
+  $("#modal-backdrop").classList.remove("hidden");
+}
 function closeModal() { $("#modal-backdrop").classList.add("hidden"); }
 $("#modal-backdrop").addEventListener("click", (e) => { if (e.target === $("#modal-backdrop")) closeModal(); });
-
-const KIND_ICONS = { exam: "📝", quiz: "❓", assignment: "📌", project: "📦", class: "🏫", other: "📅" };
 
 function pad(n) { return String(n).padStart(2, "0"); }
 function isoOf(d) { return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; }
@@ -60,10 +59,24 @@ function fmtDate(iso) {
   const [y, m, d] = iso.split("-").map(Number);
   return new Date(y, m - 1, d).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
 }
-function courseById(id) { return db.courses.find((c) => c.id === id); }
-function docsOf(courseId) { return db.docs.filter((d) => d.course_id === courseId); }
+function uuid() { return crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`; }
+function courseById(id) { return state.db.courses.find((c) => c.id === id); }
+function docsOf(courseId) { return state.db.docs.filter((d) => d.course_id === courseId); }
+function notesOf(courseId) { return state.db.notes.filter((n) => n.course_id === courseId); }
+function chatMarker(fresh) {
+  let marker = sessionStorage.getItem("msy-marker");
+  if (!marker || fresh) {
+    marker = uuid().slice(0, 36);
+    sessionStorage.setItem("msy-marker", marker);
+  }
+  return marker;
+}
+function applyTheme(theme) {
+  document.documentElement.dataset.theme = theme;
+  localStorage.setItem("msy-theme", theme);
+}
 
-/* ================= chunking ================= */
+/* ================= engine: chunking ================= */
 
 const HEADING_RE = /^([A-Z][A-Za-z0-9 &/\-']{2,60}:?|[A-Z0-9 &/\-']{4,60}|\d+\.\s+[A-Z].{2,60})$/;
 
@@ -98,7 +111,7 @@ function chunkText(text, target = 900, overlapLines = 2) {
   return chunks.filter((c) => c.text.length > 30);
 }
 
-/* ================= retrieval (BM25 + synonyms) ================= */
+/* ================= engine: retrieval ================= */
 
 const STOPWORDS = new Set(["the","a","an","and","or","of","to","in","on","for","is","are","be","do","does","i","my","me","we","you","your","it","this","that","with","at","by","as","can","if","what","when","how","will","there","any"]);
 
@@ -120,6 +133,7 @@ const SYNONYMS = {
   drop:["dropped","lowest"], makeup:["make","up","missed","alternate"],
   sick:["illness","ill","medical","absence","excused"], project:["paper","presentation","essay"],
   homework:["hw","assignment","assignments","problem","pset"], assignment:["homework","hw","due"],
+  clue:["hint","hints","clues","mentioned","said"], hint:["clue","clues","mentioned","said"],
 };
 
 function tokenize(text) {
@@ -173,7 +187,7 @@ function rankChunks(chunks, question, k = 10, charBudget = 14000) {
   return picked;
 }
 
-/* ================= heuristics: dates, facts, routing ================= */
+/* ================= engine: heuristics ================= */
 
 const MONTHS = { jan:1,january:1,feb:2,february:2,mar:3,march:3,apr:4,april:4,may:5,jun:6,june:6,jul:7,july:7,aug:8,august:8,sep:9,sept:9,september:9,oct:10,october:10,nov:11,november:11,dec:12,december:12 };
 const MONTH_DATE_RE = /\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s*(\d{4}))?/gi;
@@ -250,14 +264,10 @@ function linesMatching(lines, re, limit = 2) {
   return lines.filter((l) => re.test(l)).map((l) => l.replace(/\s+/g, " ").trim()).slice(0, limit).join(" | ");
 }
 
-function emptyFacts() {
-  return { instructor:"", instructor_email:"", office_hours:"", location_or_modality:"", late_policy:"",
-    attendance_policy:"", exam_policy:"", academic_integrity:"", textbook:"", grading:[], tas:[], other_key_policies:[] };
-}
-
 function extractFactsHeuristic(text) {
   const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-  const f = emptyFacts();
+  const f = { instructor:"", instructor_email:"", office_hours:"", location_or_modality:"", late_policy:"",
+    attendance_policy:"", exam_policy:"", academic_integrity:"", textbook:"", grading:[], tas:[], other_key_policies:[] };
   for (const ln of lines) {
     const low = ln.toLowerCase();
     if (!f.instructor && /^\s*(instructor|professor)\b/.test(low)) {
@@ -305,23 +315,23 @@ function routeQuestion(question, foundAnswer, hasTas) {
   for (const [route, re] of ROUTE_RULES) {
     if (re.test(question)) {
       if (route === "ta" && !hasTas) {
-        return ["professor", "This is a course-logistics question; with no TA listed, the instructor is the right contact."];
+        return ["professor", "Course logistics question with no TA listed, so the instructor is the right contact."];
       }
       const reasons = {
         professor: "Personal circumstances, exam conflicts, and grade decisions are instructor calls.",
-        ta: "Assignment and grading logistics are usually handled by the TAs first.",
-        classmate_or_lms: "This sounds like course-site or missed-class material — a classmate or the LMS will be faster.",
-        registrar_or_advisor: "This is about enrollment/degree rules, which live outside any one course.",
+        ta: "Assignment and grading logistics go to the TAs first.",
+        classmate_or_lms: "Course site or missed class material. A classmate or the LMS will be faster.",
+        registrar_or_advisor: "Enrollment and degree rules live outside any one course.",
       };
       return [route, reasons[route]];
     }
   }
-  if (foundAnswer) return ["none", "Your syllabus covers this — no need to email anyone."];
-  if (hasTas) return ["ta", "Your materials don't cover this. Course staff would know; start with a TA, and escalate to the professor if needed."];
-  return ["professor", "Your materials don't cover this, so the instructor is the best person to ask."];
+  if (foundAnswer) return ["none", ""];
+  if (hasTas) return ["ta", "Not covered in your materials. Start with a TA, escalate to the professor if needed."];
+  return ["professor", "Not covered in your materials, so the instructor is the best person to ask."];
 }
 
-/* ================= ICS ================= */
+/* ================= engine: ICS ================= */
 
 function icsEscape(v) { return v.replace(/\\/g, "\\\\").replace(/;/g, "\\;").replace(/,/g, "\\,").replace(/\n/g, "\\n"); }
 function icsUnescape(v) { return v.replace(/\\n/gi, "\n").replace(/\\,/g, ",").replace(/\\;/g, ";").replace(/\\\\/g, "\\"); }
@@ -404,7 +414,7 @@ function parseIcs(text) {
   return events;
 }
 
-/* ================= file extraction ================= */
+/* ================= engine: file extraction & quote locating ================= */
 
 async function extractFile(file) {
   const name = file.name.toLowerCase();
@@ -419,7 +429,7 @@ async function extractFile(file) {
     }
     const text = pages.join("\n");
     if (text.trim().length < 40) {
-      throw new Error("That PDF has no extractable text — probably a scanned image. Paste the syllabus text instead.");
+      throw new Error("That PDF has no extractable text. It's probably a scanned image; paste the syllabus text instead.");
     }
     return { text, kind: "pdf" };
   }
@@ -434,307 +444,277 @@ async function extractFile(file) {
   throw new Error("Unsupported file type. Upload a .pdf, .docx, .txt, or .md file.");
 }
 
-/* ================= Claude (browser -> Anthropic API) ================= */
-
-const QA_SYSTEM = `You are MySyllabi, a study assistant that answers a student's question using ONLY the numbered excerpts provided from their own uploaded course materials (excerpt [0], when present, is their extracted deadline calendar).
-
-HARD RULES — these define the product and are non-negotiable:
-1. GROUNDING. Every factual claim must come from the provided excerpts. Never use outside knowledge about the school, professor, course, or "typical" policies. Never guess, infer beyond the text, or fill gaps.
-2. If the excerpts don't contain the answer: status="not_found". Say plainly their materials don't cover it, and answer nothing beyond that. Do not speculate about what the policy "probably" is.
-3. If the excerpts cover only part of the question: status="partial". Answer the covered part, and state exactly which part their materials don't address.
-4. CITATIONS. Support each claim with the excerpt id and a short VERBATIM quote (an exact contiguous substring of that excerpt, under 200 characters — copy it character-for-character). An answer with status "answered" must include at least one citation. If you cannot quote it, you cannot claim it.
-5. DATES. Today is {today}. Resolve relative phrasing ("next week", "this Friday") into explicit dates using excerpt dates.
-6. If materials from multiple courses could apply and the question doesn't say which, ask which course they mean (status="partial") instead of mixing courses. When the answer is course-specific, name the course code.
-
-ROUTING — after answering, tell the student who (if anyone) to contact, using what their materials indicate:
-- "none": their materials fully answer it; note there's no need to email anyone.
-- "ta": assignment/homework clarifications, grading of specific problems, regrade mechanics, lab or section logistics — when the materials mention TAs/graders or direct such questions to them.
-- "professor": personal circumstances (illness, emergencies, extensions, accommodations), exam conflicts, absences beyond policy, grade disputes, anything the materials say to email the instructor about.
-- "classmate_or_lms": missed-lecture notes, whether something was posted, LMS/tech issues.
-- "registrar_or_advisor": enrollment, drop/add, degree requirements — outside any course's syllabus.
-If status is "not_found", pick the route for whoever WOULD know. In route_reason (one or two sentences), explain the pick; if the materials name the right contact (a specific person or email), include it.
-
-CONFIDENCE: "high" when a quote directly and unambiguously answers; "medium" when you had to combine or interpret excerpts; "low" when the support is thin.
-
-STYLE: friendly and brief — a knowledgeable classmate, not a lawyer. Lead with the answer. Plain text only (no markdown headers).`;
-
-const ANSWER_SCHEMA = {
-  type: "object", additionalProperties: false,
-  required: ["status", "answer", "citations", "route", "route_reason", "confidence"],
-  properties: {
-    status: { type: "string", enum: ["answered", "partial", "not_found"] },
-    answer: { type: "string" },
-    citations: { type: "array", items: { type: "object", additionalProperties: false,
-      required: ["excerpt_id", "quote"],
-      properties: { excerpt_id: { type: "integer" }, quote: { type: "string" } } } },
-    route: { type: "string", enum: ["none", "ta", "professor", "classmate_or_lms", "registrar_or_advisor"] },
-    route_reason: { type: "string" },
-    confidence: { type: "string", enum: ["high", "medium", "low"] },
-  },
-};
-
-const FACTS_SYSTEM = `You extract structured facts and dated deadlines from a course syllabus, for the course's own student.
-
-Rules:
-- Copy only what the syllabus actually states. Use "" (empty string) or [] for anything it doesn't state. NEVER invent, assume, or normalize policies that aren't written.
-- Keep each fact concise (one or two sentences max), in the syllabus's own wording where practical.
-- grading: one entry per graded component with its weight as written (e.g. "30%"). If no weights are given, leave the weight "".
-- other_key_policies: up to 6 short standout policies a student would want surfaced (e.g. "No extra credit", "3 slip days total", "Laptops in back rows only").
-- events: every dated deliverable or exam a student would put on a calendar. date must be ISO YYYY-MM-DD. Today is {today}; the course term is "{term}". If a date has no year, infer it from the term/today so it lands in the plausible academic window. Skip anything whose date you cannot resolve to a specific day — do not guess dates. time is "HH:MM" 24-hour if stated, else "".
-- Do not create events for ranges like "Week 3" or "TBA".`;
-
-const FACTS_SCHEMA = {
-  type: "object", additionalProperties: false, required: ["facts", "events"],
-  properties: {
-    facts: { type: "object", additionalProperties: false,
-      required: ["instructor","instructor_email","office_hours","location_or_modality","grading","late_policy","attendance_policy","exam_policy","academic_integrity","textbook","tas","other_key_policies"],
-      properties: {
-        instructor: { type: "string" }, instructor_email: { type: "string" },
-        office_hours: { type: "string" }, location_or_modality: { type: "string" },
-        grading: { type: "array", items: { type: "object", additionalProperties: false,
-          required: ["component", "weight"], properties: { component: { type: "string" }, weight: { type: "string" } } } },
-        late_policy: { type: "string" }, attendance_policy: { type: "string" },
-        exam_policy: { type: "string" }, academic_integrity: { type: "string" }, textbook: { type: "string" },
-        tas: { type: "array", items: { type: "object", additionalProperties: false,
-          required: ["name", "email", "hours"], properties: { name: { type: "string" }, email: { type: "string" }, hours: { type: "string" } } } },
-        other_key_policies: { type: "array", items: { type: "string" } },
-      } },
-    events: { type: "array", items: { type: "object", additionalProperties: false,
-      required: ["title", "date", "time", "kind"],
-      properties: { title: { type: "string" }, date: { type: "string" }, time: { type: "string" },
-        kind: { type: "string", enum: ["exam", "quiz", "assignment", "project", "class", "other"] } } } },
-  },
-};
-
-const EMAIL_SYSTEM = `You draft a short, respectful email from a student to their course staff.
-
-Rules:
-- Ground it in the provided context: mention that they checked the syllabus and what it does/doesn't say (only if the context supports that). Never invent policies, dates, or names.
-- If the context names the right recipient, use their name and put their email in to_hint; otherwise to_hint is a description like "your TA (see course site)".
-- 60-140 words. Specific subject line including the course code. Professional but natural student voice — no groveling, no filler.
-- Use [square-bracket placeholders] for anything only the student knows (their section, dates, attachments).
-- Sign with the student's name. Plain text.`;
-
-const EMAIL_SCHEMA = {
-  type: "object", additionalProperties: false, required: ["subject", "body", "to_hint"],
-  properties: { subject: { type: "string" }, body: { type: "string" }, to_hint: { type: "string" } },
-};
-
-async function callClaude({ system, user, maxTokens, effort, schema }) {
-  if (!db.apiKey) throw new Error("no-key");
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-api-key": db.apiKey,
-      "anthropic-version": "2023-06-01",
-      "anthropic-dangerous-direct-browser-access": "true",
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      max_tokens: maxTokens,
-      system,
-      messages: [{ role: "user", content: user }],
-      output_config: { effort, format: { type: "json_schema", schema } },
-    }),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const msg = (data.error && data.error.message) || `API error ${res.status}`;
-    if (res.status === 401) throw new Error("Your API key was rejected — check it in Settings.");
-    throw new Error(msg);
-  }
-  if (data.stop_reason === "refusal") throw new Error("The model declined this request.");
-  const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("");
-  return JSON.parse(text.replace(/^```(?:json)?|```$/gm, "").trim());
-}
-
 function normalizeWs(s) { return s.replace(/\s+/g, " ").trim().toLowerCase(); }
 
+function locateQuote(text, quote) {
+  const map = [];
+  let norm = "";
+  let lastSpace = true;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (/\s/.test(ch)) {
+      if (!lastSpace) { norm += " "; map.push(i); lastSpace = true; }
+    } else {
+      norm += ch.toLowerCase(); map.push(i); lastSpace = false;
+    }
+  }
+  const q = normalizeWs(quote);
+  if (!q) return null;
+  const at = norm.indexOf(q);
+  if (at < 0) return null;
+  return [map[at], map[at + q.length - 1] + 1];
+}
+
 function verifyCitations(citations, excerpts) {
-  const byId = {}, labels = {};
-  for (const ex of excerpts) { byId[ex.id] = normalizeWs(ex.text); labels[ex.id] = ex.label; }
+  const byId = {};
+  for (const ex of excerpts) byId[ex.id] = ex;
   return (citations || []).slice(0, 12).map((c) => {
+    const ex = byId[c.excerpt_id];
     const quote = (c.quote || "").trim();
     return {
       excerpt_id: c.excerpt_id,
-      label: labels[c.excerpt_id] || `excerpt ${c.excerpt_id}`,
+      label: ex ? ex.label : `excerpt ${c.excerpt_id}`,
+      doc_id: ex ? ex.doc_id : null,
       quote: quote.slice(0, 300),
-      verified: Boolean(quote) && (byId[c.excerpt_id] || "").includes(normalizeWs(quote)),
+      verified: Boolean(quote) && Boolean(ex) && normalizeWs(ex.text).includes(normalizeWs(quote)),
     };
   });
 }
 
-/* ================= domain operations ================= */
-
-function chunksForScope(courseId) {
-  const chunks = [];
-  for (const doc of db.docs) {
-    if (courseId && doc.course_id !== courseId) continue;
-    const course = courseById(doc.course_id);
-    for (const ch of doc.chunks) {
-      chunks.push({ text: ch.text, section: ch.section, code: course ? course.code : "?", filename: doc.filename });
+function detectCourseMention(question) {
+  const q = question.toLowerCase();
+  const qCompact = q.replace(/\s+/g, "");
+  const words = q.split(/[^a-z0-9]+/).filter(Boolean);
+  const hits = new Set();
+  for (const c of state.db.courses) {
+    const code = c.code.toLowerCase();
+    const compact = code.replace(/\s+/g, "");
+    const subj = (code.match(/^[a-z]+/) || [""])[0];
+    const num = (code.match(/\d{3,}/) || [""])[0];
+    let hit = q.includes(code) || (compact.length > 3 && qCompact.includes(compact)) || (num && q.includes(num));
+    if (!hit && subj.length >= 2) {
+      for (const w of words) {
+        if (w === subj || (w.length >= 3 && subj.length >= 3 && (w.startsWith(subj) || subj.startsWith(w)))) { hit = true; break; }
+      }
     }
+    if (hit) hits.add(c.id);
   }
-  return chunks;
+  return hits.size === 1 ? [...hits][0] : null;
 }
 
-function dedupeKey(t) { return t.toLowerCase().split(/\s+/).join(" ").slice(0, 60); }
+/* ================= data layer (remote Supabase / local demo) ================= */
 
-function addEvents(courseId, docId, events, source) {
-  const existing = new Set(db.events.filter((e) => e.course_id === courseId)
-    .map((e) => e.date + "|" + dedupeKey(e.title)));
-  let added = 0;
-  for (const ev of events.slice(0, 150)) {
-    const key = ev.date + "|" + dedupeKey(ev.title);
-    if (existing.has(key)) continue;
-    existing.add(key);
-    db.events.push({ id: uid(), course_id: courseId, document_id: docId, title: ev.title.slice(0, 140),
-      date: ev.date, time: ev.time || "", kind: ev.kind || "other", source, details: ev.details || "" });
-    added++;
-  }
-  return added;
+const LOCAL_KEY = "mysyllabi-local-v2";
+
+function localLoad() {
+  try {
+    const raw = localStorage.getItem(LOCAL_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch (_e) { /* fresh */ }
+  return { courses: [], docs: [], events: [], notes: [], sessions: [], chats: [] };
+}
+let localDb = REMOTE ? null : localLoad();
+function localSave() { localStorage.setItem(LOCAL_KEY, JSON.stringify(localDb)); }
+
+async function sbThrow(promise) {
+  const { data, error } = await promise;
+  if (error) throw new Error(error.message);
+  return data;
 }
 
-async function ingestDocument(course, filename, text, kind) {
-  text = text.trim();
-  if (text.length < 40) throw new Error("That document looks empty — nothing to index.");
-  const doc = { id: uid(), course_id: course.id, filename, kind, text,
-    chunks: chunkText(text), facts: null, facts_mode: "heuristic",
-    uploaded_at: isoToday() };
-  let events = [];
-  if (db.apiKey) {
-    try {
-      const result = await callClaude({
-        system: FACTS_SYSTEM.replace("{today}", isoToday()).replace("{term}", course.term || "not specified"),
-        user: `SYLLABUS for ${course.code}:\n\n${text.slice(0, 60000)}`,
-        maxTokens: 12000, effort: "medium", schema: FACTS_SCHEMA,
-      });
-      doc.facts = result.facts;
-      doc.facts_mode = "ai";
-      events = (result.events || []).filter((e) => /^\d{4}-\d{2}-\d{2}$/.test(e.date))
-        .map((e) => ({ ...e, time: /^\d{2}:\d{2}$/.test(e.time) ? e.time : "" }));
-    } catch (_e) { /* fall through to heuristics */ }
-  }
-  if (!doc.facts) {
-    doc.facts = extractFactsHeuristic(text);
-    events = extractEventsHeuristic(text);
-  }
-  db.docs.push(doc);
-  const eventsAdded = addEvents(course.id, doc.id, events, "auto");
-  save();
-  return { doc, eventsAdded };
-}
-
-function calendarExcerpt() {
-  const today = isoToday(), horizon = addDays(today, 120);
-  const rows = db.events.filter((e) => e.date >= today && e.date <= horizon)
-    .sort((a, b) => a.date.localeCompare(b.date)).slice(0, 45);
-  if (!rows.length) return null;
-  const lines = rows.map((e) => {
-    const c = e.course_id ? courseById(e.course_id) : null;
-    return `${e.date}${e.time ? " " + e.time : ""} (${e.kind}) ${c ? "[" + c.code + "] " : ""}${e.title}`;
-  });
-  return { id: 0, label: "Your deadline calendar (next ~4 months, extracted from your materials)", text: lines.join("\n") };
-}
-
-async function doAsk(question, courseId) {
-  const chunks = chunksForScope(courseId);
-  if (!chunks.length) throw new Error("Upload at least one syllabus first — I only answer from your materials.");
-  const ranked = rankChunks(chunks, question);
-  const excerpts = [];
-  const cal = calendarExcerpt();
-  if (cal) excerpts.push(cal);
-  ranked.forEach(([score, ch], i) => {
-    excerpts.push({ id: i + 1, label: `${ch.code} — ${ch.section || ch.filename}`, text: ch.text, score });
-  });
-
-  let result;
-  if (db.apiKey) {
-    try {
-      const scope = courseId ? `the student limited this question to ${courseById(courseId).code}` : "all of the student's courses";
-      let prompt = "EXCERPTS FROM THE STUDENT'S MATERIALS:\n\n" +
-        excerpts.map((ex) => `[${ex.id}] ${ex.label}\n${ex.text}`).join("\n\n---\n\n");
-      const history = db.chats.slice(-4).map((c) => `Q: ${c.question}\nA: ${(c.answer.answer || "").slice(0, 400)}`);
-      if (history.length) prompt += `\n\nRECENT CONVERSATION (context only — NOT a source, never cite it):\n${history.join("\n")}`;
-      prompt += `\n\nSCOPE: ${scope}\nSTUDENT'S QUESTION: ${question}`;
-      result = await callClaude({
-        system: QA_SYSTEM.replace("{today}", new Date().toDateString()),
-        user: prompt, maxTokens: 6000, effort: "medium", schema: ANSWER_SCHEMA,
-      });
-      result.citations = verifyCitations(result.citations, excerpts);
-      result.unverified = result.status === "answered" && !result.citations.some((c) => c.verified);
-      result.mode = "ai";
-    } catch (e) {
-      result = heuristicAnswer(question, excerpts);
-      result.mode = "heuristic";
-      result.note = `AI call failed (${e.message}) — showing keyword matches instead.`;
+const repo = {
+  async loadAll() {
+    if (REMOTE) {
+      const [courses, docs, events, notes, sessions] = await Promise.all([
+        sbThrow(supa.from("courses").select("id, code, title, term, instructor, color, allowances").order("created_at")),
+        sbThrow(supa.from("documents").select("id, course_id, filename, kind, facts, facts_mode, chunks, uploaded_at").order("uploaded_at")),
+        sbThrow(supa.from("events").select("*").order("date")),
+        sbThrow(supa.from("notes").select("id, course_id, text, created_at").order("created_at", { ascending: false })),
+        sbThrow(supa.from("chat_sessions").select("*").order("last_at", { ascending: false })),
+      ]);
+      state.db = { courses, docs, events, notes, sessions };
+    } else {
+      state.db = {
+        courses: localDb.courses, docs: localDb.docs, events: localDb.events,
+        notes: localDb.notes, sessions: localDb.sessions,
+      };
     }
-  } else {
-    result = heuristicAnswer(question, excerpts);
-    result.mode = "heuristic";
-  }
-  db.chats.push({ id: uid(), course_id: courseId || null, question, answer: result, created_at: isoToday() });
-  if (db.chats.length > 80) db.chats = db.chats.slice(-80);
-  save();
-  return result;
-}
+  },
 
-function heuristicAnswer(question, excerpts) {
-  const passages = excerpts.filter((e) => e.id !== 0);
-  const found = passages.length > 0 && (passages[0].score || 0) >= 1.2;
-  const hasTas = db.docs.some((d) => d.facts && d.facts.tas && d.facts.tas.length) ||
-    passages.slice(0, 3).some((p) => /\bTAs?\b/.test(p.text));
-  const [route, reason] = routeQuestion(question, found, hasTas);
-  return {
-    status: found ? "partial" : "not_found",
-    answer: found
-      ? "AI answers are off (no API key set in Settings), so here are the passages from your own materials that best match your question — the answer is very likely in the first one."
-      : "Nothing in your uploaded materials matches this question, and I never guess. It may simply not be covered by your syllabi.",
-    citations: found ? passages.slice(0, 3).map((p) => ({ excerpt_id: p.id, label: p.label, quote: p.text.slice(0, 400), verified: true })) : [],
-    route, route_reason: reason, confidence: "low",
-  };
-}
+  async addCourse(fields) {
+    const course = { id: uuid(), allowances: [], ...fields };
+    if (REMOTE) await sbThrow(supa.from("courses").insert({ ...course, user_id: state.user.id }));
+    state.db.courses.push(course);
+    if (!REMOTE) localSave();
+    return course;
+  },
 
-async function draftEmail({ question, recipient, course_id, context }) {
-  const course = course_id ? courseById(course_id) : null;
-  const code = course ? course.code : "your class";
-  if (db.apiKey) {
-    try {
-      const draft = await callClaude({
-        system: EMAIL_SYSTEM,
-        user: `Student: [your name]\nCourse: ${code}\nRecipient type: ${recipient}\nWhat they want to ask about: ${question}\n\nRelevant material from their syllabus/answer:\n${(context || "").slice(0, 6000)}`,
-        maxTokens: 3000, effort: "low", schema: EMAIL_SCHEMA,
-      });
-      draft.mode = "ai";
-      return draft;
-    } catch (_e) { /* template fallback */ }
-  }
-  let toHint = "";
-  if (course) {
-    for (const d of docsOf(course.id)) {
-      if (!d.facts) continue;
-      if (recipient === "ta" && d.facts.tas && d.facts.tas.length) toHint = d.facts.tas[0].email || "";
-      if (!toHint) toHint = d.facts.instructor_email || "";
-      if (toHint) break;
+  async delCourse(id) {
+    if (REMOTE) await sbThrow(supa.from("courses").delete().eq("id", id));
+    state.db.courses = state.db.courses.filter((c) => c.id !== id);
+    state.db.docs = state.db.docs.filter((d) => d.course_id !== id);
+    state.db.events = state.db.events.filter((e) => e.course_id !== id);
+    state.db.notes = state.db.notes.filter((n) => n.course_id !== id);
+    if (!REMOTE) localSave();
+  },
+
+  async saveAllowances(course) {
+    if (REMOTE) await sbThrow(supa.from("courses").update({ allowances: course.allowances }).eq("id", course.id));
+    if (!REMOTE) localSave();
+  },
+
+  async addDocument(doc) {
+    if (REMOTE) {
+      await sbThrow(supa.from("documents").insert({ ...doc, user_id: state.user.id }));
+      const { text, ...meta } = doc;
+      state.db.docs.push(meta);
+    } else {
+      state.db.docs.push(doc);
+      localSave();
     }
-  }
-  const words = question.split(/\s+/);
-  const topic = words.slice(0, 9).join(" ") + (words.length > 9 ? "…" : "");
-  return {
-    mode: "template",
-    subject: (course ? `[${code}] ` : "") + (topic ? `Question: ${topic}` : "Quick question"),
-    to_hint: toHint || (recipient === "ta" ? "your TA (see course site)" : "your instructor"),
-    body: `Dear ${recipient === "professor" ? "Professor [name]" : "[TA's name]"},\n\n` +
-      `${course ? `I'm in your ${code} class this term.` : "I'm in your class this term."} I checked the syllabus first, but I still wanted to ask: ${question}\n\n` +
-      `[Add one sentence of context — your situation, section, or dates.]\n\nThank you for your time,\n[Your name]`,
-  };
-}
+  },
+
+  async delDocument(id) {
+    if (REMOTE) await sbThrow(supa.from("documents").delete().eq("id", id));
+    state.db.docs = state.db.docs.filter((d) => d.id !== id);
+    state.db.events = state.db.events.filter((e) => e.document_id !== id);
+    if (!REMOTE) localSave();
+  },
+
+  async addNote(courseId, text) {
+    const note = { id: uuid(), course_id: courseId, text, created_at: new Date().toISOString() };
+    if (REMOTE) await sbThrow(supa.from("notes").insert({ ...note, user_id: state.user.id }));
+    state.db.notes.unshift(note);
+    const added = await this.addEventsBulk(courseId, null, extractEventsHeuristic(text), "note");
+    if (!REMOTE) localSave();
+    return added;
+  },
+
+  async delNote(id) {
+    if (REMOTE) await sbThrow(supa.from("notes").delete().eq("id", id));
+    state.db.notes = state.db.notes.filter((n) => n.id !== id);
+    if (!REMOTE) localSave();
+  },
+
+  async addEventsBulk(courseId, docId, events, source) {
+    const existing = new Set(state.db.events.filter((e) => e.course_id === courseId)
+      .map((e) => e.date + "|" + normalizeWs(e.title).slice(0, 60)));
+    const rows = [];
+    for (const ev of events.slice(0, 150)) {
+      const key = ev.date + "|" + normalizeWs(ev.title).slice(0, 60);
+      if (existing.has(key)) continue;
+      existing.add(key);
+      rows.push({ id: uuid(), course_id: courseId, document_id: docId, title: ev.title.slice(0, 140),
+        date: ev.date, time: ev.time || "", kind: ev.kind || "other", source, details: ev.details || "" });
+    }
+    if (rows.length) {
+      if (REMOTE) await sbThrow(supa.from("events").insert(rows.map((r) => ({ ...r, user_id: state.user.id }))));
+      state.db.events.push(...rows);
+      if (!REMOTE) localSave();
+    }
+    return rows.length;
+  },
+
+  async addEvent(ev) {
+    const row = { id: uuid(), ...ev };
+    if (REMOTE) await sbThrow(supa.from("events").insert({ ...row, user_id: state.user.id }));
+    state.db.events.push(row);
+    if (!REMOTE) localSave();
+  },
+
+  async delEvent(id) {
+    if (REMOTE) await sbThrow(supa.from("events").delete().eq("id", id));
+    state.db.events = state.db.events.filter((e) => e.id !== id);
+    if (!REMOTE) localSave();
+  },
+
+  async getSource(docId) {
+    if (String(docId).startsWith("notes-")) {
+      const courseId = String(docId).slice(6);
+      const course = courseById(courseId);
+      const notes = notesOf(courseId).slice().reverse();
+      return { title: `${course ? course.code : ""} class notes`,
+        text: notes.map((n) => `[${(n.created_at || "").slice(0, 10)}]\n${n.text}`).join("\n\n") };
+    }
+    if (REMOTE) {
+      const data = await sbThrow(supa.from("documents").select("filename, text").eq("id", docId).single());
+      return { title: data.filename, text: data.text };
+    }
+    const doc = state.db.docs.find((d) => d.id === docId);
+    return doc ? { title: doc.filename, text: doc.text } : null;
+  },
+
+  async ensureSession() {
+    const marker = chatMarker();
+    const now = Date.now();
+    let session = state.db.sessions.find((s) => s.marker === marker);
+    if (session && now - new Date(session.last_at).getTime() <= SESSION_GAP_MS) {
+      session.last_at = new Date().toISOString();
+      if (REMOTE) await sbThrow(supa.from("chat_sessions").update({ last_at: session.last_at }).eq("id", session.id));
+      else localSave();
+      return session;
+    }
+    if (session) chatMarker(true);
+    session = { id: uuid(), marker: chatMarker(), title: "",
+      started_at: new Date().toISOString(), last_at: new Date().toISOString() };
+    if (REMOTE) await sbThrow(supa.from("chat_sessions").insert({ ...session, user_id: state.user.id }));
+    state.db.sessions.unshift(session);
+    if (!REMOTE) localSave();
+    return session;
+  },
+
+  async listChats(sessionId) {
+    if (REMOTE) {
+      return await sbThrow(supa.from("chats").select("id, course_id, question, answer, created_at")
+        .eq("session_id", sessionId).order("created_at"));
+    }
+    return localDb.chats.filter((c) => c.session_id === sessionId);
+  },
+
+  async addChat(session, question, answer, courseId) {
+    const chat = { id: uuid(), session_id: session.id, course_id: courseId,
+      question, answer, created_at: new Date().toISOString() };
+    if (REMOTE) {
+      await sbThrow(supa.from("chats").insert({ ...chat, user_id: state.user.id }));
+      if (!session.title) await sbThrow(supa.from("chat_sessions").update({ title: question.slice(0, 60) }).eq("id", session.id));
+    } else {
+      localDb.chats.push(chat);
+    }
+    if (!session.title) session.title = question.slice(0, 60);
+    session.count = (session.count || 0) + 1;
+    if (!REMOTE) localSave();
+    return chat;
+  },
+
+  async clearChats() {
+    if (REMOTE) {
+      await sbThrow(supa.from("chats").delete().eq("user_id", state.user.id));
+      await sbThrow(supa.from("chat_sessions").delete().eq("user_id", state.user.id));
+    } else {
+      localDb.chats = []; localDb.sessions = []; localSave();
+    }
+    state.db.sessions = [];
+    state.currentSessionId = null; state.viewingSessionId = null; state.msgs = [];
+  },
+
+  // Calls the edge function. Returns null in local mode (caller falls back to heuristics).
+  async invokeClaude(payload) {
+    if (!REMOTE) return null;
+    const { data, error } = await supa.functions.invoke("claude", { body: payload });
+    if (error) throw new Error(error.message || "AI server unreachable.");
+    if (data && data.usage) {
+      state.usage = data.usage;
+      renderAiPill();
+    }
+    return data;
+  },
+};
 
 /* ================= demo data ================= */
 
 const DEMO = [
   { code: "CS 2110", title: "Data Structures & OO Programming", instructor: "Prof. Elena Marchetti", color: "#4f46e5",
+    allowances: [{ label: "Slip days", emoji: "🎟", total: 3, remaining: 3 }],
     text: `CS 2110: Data Structures and Object-Oriented Programming
 Big Hill University — Fall 2026
 
@@ -748,7 +728,7 @@ TA: Priya Nair (pnair@bighill.edu), office hours Mondays 3:00-5:00 pm, Rhodes 57
 Questions about homework grading, rubrics, and regrades go to the TAs first, not the instructor.
 
 Textbook
-Textbook: "Data Structures and Abstractions with Java" — the full text is FREE online through the university library. No purchase is required.
+Textbook: "Data Structures and Abstractions with Java" — the full text is FREE online through the university library.
 
 Grading
 Homework: 30%
@@ -779,7 +759,7 @@ After slip days are used, late homework loses 10% per day and is not accepted mo
 Extensions beyond slip days are granted only by the instructor for documented illness, family emergencies, or university conflicts.
 
 Regrades
-Regrade requests are submitted through Gradescope within 7 days of grades being released and are handled by the TAs.
+Regrade requests are submitted through Gradescope within 7 days and are handled by the TAs.
 
 Extra Credit
 There is no extra credit in this course.
@@ -787,6 +767,7 @@ There is no extra credit in this course.
 Academic Integrity
 All submitted code must be written by you alone. Using AI assistants to generate homework solutions is a violation of the academic integrity code.` },
   { code: "PSYC 1101", title: "Introduction to Psychology", instructor: "Dr. Sam Okafor", color: "#0d9488",
+    allowances: [{ label: "Class skips", emoji: "🏫", total: 5, remaining: 5 }],
     text: `PSYC 1101: Introduction to Psychology
 Big Hill University — Fall 2026
 
@@ -823,6 +804,7 @@ You must complete 4 SONA research credits by Friday, December 4, 2026.
 Academic Integrity
 Quizzes are open-book but individual. Sharing quiz answers in group chats is an academic integrity violation.` },
   { code: "MATH 2400", title: "Linear Algebra", instructor: "Prof. Daniel Reyes", color: "#d97706",
+    allowances: [],
     text: `MATH 2400: Linear Algebra
 Big Hill University — Fall 2026
 
@@ -856,6 +838,7 @@ A missed midterm with a documented emergency shifts its weight to the final exam
 Academic Integrity
 You may collaborate on problem sets in groups of up to 3, but each student writes up solutions independently.` },
   { code: "PHIL 1010", title: "Introduction to Ethics", instructor: "Dr. Naomi Feld", color: "#db2777",
+    allowances: [{ label: "Class skips", emoji: "🏫", total: 3, remaining: 3 }],
     text: `PHIL 1010: Introduction to Ethics
 Big Hill University — Fall 2026
 
@@ -886,51 +869,190 @@ Academic Integrity
 Essays are checked for plagiarism and AI generation. Cite everything.` },
 ];
 
+async function ingestDocument(course, filename, text, kind, quiet) {
+  text = text.trim();
+  if (text.length < 40) throw new Error("That document looks empty. Nothing to index.");
+  const doc = { id: uuid(), course_id: course.id, filename, kind, text,
+    chunks: chunkText(text), facts: null, facts_mode: "heuristic",
+    uploaded_at: new Date().toISOString() };
+  let events = [];
+  if (REMOTE && state.usage.on && !quiet) {
+    try {
+      const res = await repo.invokeClaude({ kind: "extract", text, code: course.code, term: course.term || "" });
+      if (res && res.result) {
+        doc.facts = res.result.facts;
+        doc.facts_mode = "ai";
+        events = (res.result.events || []).filter((e) => /^\d{4}-\d{2}-\d{2}$/.test(e.date))
+          .map((e) => ({ ...e, time: /^\d{2}:\d{2}$/.test(e.time) ? e.time : "" }));
+      }
+    } catch (_e) { /* heuristics below */ }
+  }
+  if (!doc.facts) {
+    doc.facts = extractFactsHeuristic(text);
+    events = extractEventsHeuristic(text);
+  }
+  await repo.addDocument(doc);
+  const eventsAdded = await repo.addEventsBulk(course.id, doc.id, events, "auto");
+  return { doc, eventsAdded };
+}
+
 async function loadDemo() {
   for (const spec of DEMO) {
-    if (db.courses.some((c) => c.code === spec.code)) continue;
-    const course = { id: uid(), code: spec.code, title: spec.title, term: "Fall 2026",
-      instructor: spec.instructor, color: spec.color };
-    db.courses.push(course);
-    await ingestDocument(course, spec.code.toLowerCase().replace(/\s+/g, "") + "-syllabus.txt", spec.text, "txt");
+    if (state.db.courses.some((c) => c.code === spec.code)) continue;
+    const course = await repo.addCourse({ code: spec.code, title: spec.title, term: "Fall 2026",
+      instructor: spec.instructor, color: spec.color, allowances: spec.allowances });
+    // quiet=true: demo seeding never spends AI calls.
+    await ingestDocument(course, spec.code.toLowerCase().replace(/\s+/g, "") + "-syllabus.txt", spec.text, "txt", true);
   }
-  save();
+}
+
+/* ================= ask pipeline ================= */
+
+function chunkPool(courseId) {
+  const pool = [];
+  for (const doc of state.db.docs) {
+    if (courseId && doc.course_id !== courseId) continue;
+    const course = courseById(doc.course_id);
+    for (const ch of doc.chunks || []) {
+      pool.push({ text: ch.text, section: ch.section, code: course ? course.code : "?",
+        filename: doc.filename, doc_id: doc.id });
+    }
+  }
+  for (const course of state.db.courses) {
+    if (courseId && course.id !== courseId) continue;
+    for (const note of notesOf(course.id)) {
+      pool.push({ text: note.text, section: `Note (${(note.created_at || "").slice(0, 10)})`,
+        code: course.code, filename: "Class notes", doc_id: "notes-" + course.id });
+    }
+  }
+  return pool;
+}
+
+function calendarExcerpt() {
+  const today = isoToday(), horizon = addDays(today, 120);
+  const rows = state.db.events.filter((e) => e.date >= today && e.date <= horizon)
+    .sort((a, b) => a.date.localeCompare(b.date)).slice(0, 45);
+  if (!rows.length) return null;
+  const lines = rows.map((e) => {
+    const c = e.course_id ? courseById(e.course_id) : null;
+    return `${e.date}${e.time ? " " + e.time : ""} (${e.kind}) ${c ? "[" + c.code + "] " : ""}${e.title}`;
+  });
+  return { id: 0, label: "Your deadline calendar", doc_id: null, text: lines.join("\n") };
+}
+
+function heuristicAnswer(question, excerpts) {
+  const passages = excerpts.filter((e) => e.id !== 0);
+  const found = passages.length > 0 && (passages[0].score || 0) >= 1.2;
+  const hasTas = state.db.docs.some((d) => d.facts && d.facts.tas && d.facts.tas.length) ||
+    passages.slice(0, 3).some((p) => /\bTAs?\b/.test(p.text));
+  const [route, reason] = routeQuestion(question, found, hasTas);
+  return {
+    status: found ? "partial" : "not_found",
+    answer: found
+      ? "Best matching passages from your materials are below; the first very likely answers this."
+      : "Not covered in your uploaded materials. I don't guess.",
+    citations: found ? passages.slice(0, 3).map((p) => ({ excerpt_id: p.id, label: p.label,
+      doc_id: p.doc_id, quote: p.text.slice(0, 400), verified: true })) : [],
+    route, route_reason: reason, confidence: "low",
+  };
+}
+
+async function doAsk(question, courseId, scopeNote) {
+  const pool = chunkPool(courseId);
+  if (!pool.length) throw new Error("Upload at least one syllabus first. I only answer from your materials.");
+  const ranked = rankChunks(pool, question);
+  const excerpts = [];
+  const cal = calendarExcerpt();
+  if (cal) excerpts.push(cal);
+  ranked.forEach(([score, ch], i) => {
+    excerpts.push({ id: i + 1, label: `${ch.code} — ${ch.section || ch.filename}`,
+      doc_id: ch.doc_id, text: ch.text, score });
+  });
+
+  const session = await repo.ensureSession();
+  let result = null;
+  if (REMOTE && state.usage.on) {
+    try {
+      const scope = courseId ? `the student limited this question to ${courseById(courseId).code}` : "all of the student's courses";
+      const history = state.msgs.slice(-4).map((m) => ({ q: m.question, a: (m.answer.answer || "").slice(0, 400) }));
+      const res = await repo.invokeClaude({
+        kind: "ask", question, scope, history,
+        excerpts: excerpts.map((ex) => ({ id: ex.id, label: ex.label, text: ex.text })),
+      });
+      if (res && res.result) {
+        result = res.result;
+        result.citations = verifyCitations(result.citations, excerpts);
+        result.unverified = result.status === "answered" && !result.citations.some((c) => c.verified);
+        result.mode = "ai";
+      } else if (res && res.limited) {
+        result = heuristicAnswer(question, excerpts);
+        result.mode = "heuristic";
+        result.note = res.reason === "limit"
+          ? `You've used all ${res.usage.limit} AI answers for today. Keyword matches below; the counter resets tomorrow.`
+          : "AI isn't set up on this server yet. Keyword matches below.";
+      } else if (res && res.error) {
+        result = heuristicAnswer(question, excerpts);
+        result.mode = "heuristic";
+        result.note = res.error;
+      }
+    } catch (e) {
+      result = heuristicAnswer(question, excerpts);
+      result.mode = "heuristic";
+      result.note = `AI call failed (${e.message}). Showing keyword matches instead.`;
+    }
+  }
+  if (!result) {
+    result = heuristicAnswer(question, excerpts);
+    result.mode = "heuristic";
+  }
+  if (scopeNote) result.scope_note = scopeNote;
+  await repo.addChat(session, question, result, courseId);
+  state.currentSessionId = session.id;
+  state.msgs.push({ question, answer: result, course_id: courseId });
+  return result;
 }
 
 /* ================= views ================= */
 
-let view = "dashboard";
-let askCourse = "";
-let calMonth = null;
-let selectedDay = null;
-
 function renderAiPill() {
   const pill = $("#ai-pill");
-  if (db.apiKey) {
+  if (!REMOTE) {
+    pill.className = "ai-pill off";
+    pill.textContent = "✦ Demo mode (this browser only)";
+    pill.title = "No server configured yet. Data stays in this browser; answers are keyword matches.";
+  } else if (state.usage.on) {
     pill.className = "ai-pill on";
-    pill.textContent = `✦ AI answers on · ${MODEL}`;
+    pill.textContent = `✦ AI answers on · ${state.usage.left} left today`;
+    pill.title = `Each account gets ${state.usage.limit} AI answers per day. Resets at midnight (UTC).`;
   } else {
     pill.className = "ai-pill off";
-    pill.textContent = "✦ Keyword mode — add API key";
+    pill.textContent = "✦ Keyword mode";
+    pill.title = "AI answers are not enabled on this server yet.";
   }
 }
 
-function navigate(v, param) {
-  view = v;
-  $$("#nav .nav-item").forEach((a) => a.classList.toggle("active", a.dataset.view === v));
-  if (v === "dashboard") renderDashboard();
-  else if (v === "course") renderCourse(param);
-  else if (v === "ask") renderAsk();
-  else if (v === "calendar") renderCalendar();
-  else if (v === "settings") renderSettings();
+function navigate(view, param) {
+  $$("#nav .nav-item").forEach((a) => a.classList.toggle("active", a.dataset.view === view));
+  if (view === "dashboard") renderDashboard();
+  else if (view === "course") renderCourse(param);
+  else if (view === "ask") renderAsk();
+  else if (view === "calendar") renderCalendar();
+  else if (view === "settings") renderSettings();
 }
 window.navigate = navigate;
 
 /* ---------- dashboard ---------- */
 
+function allowanceChips(c) {
+  return (c.allowances || []).map((a, i) => `
+    <span class="allow-chip ${a.remaining === 0 ? "zero" : ""}" data-course="${c.id}" data-idx="${i}"
+      title="${esc(a.label)}: ${a.remaining} of ${a.total} left. Click to use one.">
+      ${esc(a.emoji || "🎟")} ${a.remaining}/${a.total}</span>`).join("");
+}
+
 function renderDashboard() {
   const today = isoToday(), horizon = addDays(today, 14);
-  const upcoming = db.events.filter((e) => e.date >= today && e.date <= horizon)
+  const upcoming = state.db.events.filter((e) => e.date >= today && e.date <= horizon)
     .sort((a, b) => a.date.localeCompare(b.date)).slice(0, 10);
   const upHtml = upcoming.length ? `
     <div class="upcoming-strip"><h3>Next 14 days</h3><div class="up-list">${upcoming.map((e) => {
@@ -939,48 +1061,54 @@ function renderDashboard() {
         <div class="t">${KIND_ICONS[e.kind] || "📅"} ${c ? `<b>${esc(c.code)}</b> ` : ""}${esc(e.title)}</div></div>`;
     }).join("")}</div></div>` : "";
 
-  const welcome = !db.courses.length ? `
+  const welcome = !state.db.courses.length ? `
     <div class="card" style="margin-bottom:20px">
-      <h3>👋 Welcome — here's the deal</h3>
-      <p style="color:var(--ink-soft)">MySyllabi answers course questions <b>only from syllabi you upload</b> — with quotes to prove it — and tells you whether that email to your professor is even necessary. Everything you add stays in <b>this browser</b> on your device: no account, no server, nothing shared.</p>
-      <div style="display:flex;gap:10px;flex-wrap:wrap">
-        <button class="btn primary" id="load-demo">🎓 Load 4 demo courses</button>
-        <button class="btn" id="add-course-btn2">+ Add your own course</button>
-      </div>
+      <h3>👋 Welcome</h3>
+      <p style="color:var(--ink-soft)">MySyllabi answers course questions <b>only from syllabi you upload</b>, with quotes to prove it, and tells you whether that email to your professor is even necessary.</p>
+      <button class="btn primary" id="load-demo">🎓 Load 4 demo courses</button>
     </div>` : "";
 
   $("#view").innerHTML = `
     <div class="view-head">
       <div><h1>Your courses</h1>
-        <div class="sub">Upload each course's syllabus once — then ask questions instead of scrolling PDFs.</div></div>
+        <div class="sub">Upload each course's syllabus once, then ask questions instead of scrolling PDFs.</div></div>
       <button class="btn primary" id="add-course-btn">+ Add course</button>
     </div>
     ${welcome}${upHtml}
     <div class="course-grid">
-      ${db.courses.map((c) => {
-        const count = docsOf(c.id).length;
-        const next = db.events.filter((e) => e.course_id === c.id && e.date >= today)
+      ${state.db.courses.map((c) => {
+        const next = state.db.events.filter((e) => e.course_id === c.id && e.date >= today)
           .sort((a, b) => a.date.localeCompare(b.date))[0];
         return `<div class="card course-card" data-id="${c.id}">
           <div class="stripe" style="background:${esc(c.color)}"></div>
           <h3>${esc(c.code)}</h3><div class="ctitle">${esc(c.title || "")}</div>
-          <div class="cmeta"><span class="chip">${count} doc${count === 1 ? "" : "s"}</span>
-          ${next ? `<span class="chip accent">${KIND_ICONS[next.kind] || "📅"} ${fmtDate(next.date)}</span>` : ""}</div>
+          <div class="cmeta">
+            ${next ? `<span class="chip accent">${KIND_ICONS[next.kind] || "📅"} ${fmtDate(next.date)}</span>` : ""}
+            ${allowanceChips(c)}
+          </div>
         </div>`;
       }).join("")}
-      <div class="card add-card" id="add-course-card">+ Add a course</div>
-    </div>`;
+    </div>
+    ${state.db.courses.length === 0 ? `<div class="empty"><div class="big-ic">🎓</div>No courses yet.</div>` : ""}`;
 
-  $$(".course-card").forEach((el) => el.addEventListener("click", () => navigate("course", Number(el.dataset.id))));
+  $$(".course-card").forEach((el) => el.addEventListener("click", () => navigate("course", el.dataset.id)));
+  $$(".allow-chip").forEach((chip) => chip.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    const c = courseById(chip.dataset.course);
+    const a = (c.allowances || [])[Number(chip.dataset.idx)];
+    if (!a) return;
+    if (a.remaining <= 0) return toast(`${a.label}: none left in ${c.code}.`, "err");
+    a.remaining--;
+    await repo.saveAllowances(c);
+    toast(`${c.code} ${a.label}: ${a.remaining} of ${a.total} left.`);
+    renderDashboard();
+  }));
   $("#add-course-btn").addEventListener("click", openAddCourse);
-  $("#add-course-card").addEventListener("click", openAddCourse);
-  const btn2 = $("#add-course-btn2");
-  if (btn2) btn2.addEventListener("click", openAddCourse);
   const demoBtn = $("#load-demo");
   if (demoBtn) demoBtn.addEventListener("click", async () => {
     demoBtn.disabled = true; demoBtn.textContent = "Loading…";
-    await loadDemo();
-    toast("Demo courses loaded — try Ask!");
+    try { await loadDemo(); toast("Demo courses loaded. Try Ask!"); }
+    catch (err) { toast(err.message, "err"); }
     renderDashboard();
   });
 }
@@ -999,28 +1127,70 @@ function openAddCourse() {
     <div class="field"><label>Color</label><div class="color-dots">${dots}</div></div>
     <div class="modal-actions"><button class="btn" id="nc-cancel">Cancel</button>
     <button class="btn primary" id="nc-save">Add course</button></div>`);
-  let color = COURSE_COLORS[db.courses.length % COURSE_COLORS.length];
+  let color = COURSE_COLORS[state.db.courses.length % COURSE_COLORS.length];
   $$(".color-dot").forEach((dot) => dot.addEventListener("click", () => {
     $$(".color-dot").forEach((d) => d.classList.remove("sel"));
     dot.classList.add("sel"); color = dot.dataset.color;
   }));
   $("#nc-cancel").addEventListener("click", closeModal);
-  $("#nc-save").addEventListener("click", () => {
+  $("#nc-save").addEventListener("click", async () => {
     const code = $("#nc-code").value.trim().slice(0, 40);
     if (!code) return toast("Course code is required (e.g. CS 2110).", "err");
-    const course = { id: uid(), code, title: $("#nc-title").value.trim().slice(0, 120),
-      term: $("#nc-term").value.trim().slice(0, 40), instructor: $("#nc-inst").value.trim().slice(0, 80), color };
-    db.courses.push(course); save(); closeModal();
-    toast("Course added — now drop in its syllabus.");
-    navigate("course", course.id);
+    try {
+      const course = await repo.addCourse({ code, title: $("#nc-title").value.trim().slice(0, 120),
+        term: $("#nc-term").value.trim().slice(0, 40), instructor: $("#nc-inst").value.trim().slice(0, 80), color });
+      closeModal(); toast("Course added. Now drop in its syllabus.");
+      navigate("course", course.id);
+    } catch (err) { toast(err.message, "err"); }
   });
+}
+
+/* ---------- source viewer ---------- */
+
+async function openDocViewer(docId, quote) {
+  let src;
+  try { src = await repo.getSource(docId); } catch (err) { return toast(err.message, "err"); }
+  if (!src) return toast("That document no longer exists.", "err");
+  let bodyHtml = null;
+  let found = false;
+  if (quote) {
+    const range = locateQuote(src.text, quote);
+    if (range) {
+      found = true;
+      bodyHtml = esc(src.text.slice(0, range[0])) +
+        `<mark class="src-hl" id="src-hl">` + esc(src.text.slice(range[0], range[1])) + `</mark>` +
+        esc(src.text.slice(range[1]));
+    }
+  }
+  if (!bodyHtml) bodyHtml = esc(src.text);
+  openModal(`
+    <div class="doc-view-head">
+      <h3>📄 ${esc(src.title)}</h3>
+      <button class="btn small" id="dv-close">Close ✕</button>
+    </div>
+    ${quote && !found ? `<p class="muted">Couldn't pinpoint the exact quote, showing the whole document.</p>` : ""}
+    <div class="doc-view-body">${bodyHtml}</div>`, true);
+  $("#dv-close").addEventListener("click", closeModal);
+  if (found) {
+    let tries = 0;
+    const center = () => {
+      const mark = $("#src-hl");
+      const bodyEl = $(".doc-view-body");
+      if (!mark || !bodyEl) return;
+      const target = Math.max(0, mark.offsetTop - bodyEl.clientHeight / 2);
+      bodyEl.scrollTop = target;
+      if (bodyEl.scrollTop < target - 4 && ++tries < 20) setTimeout(center, 100);
+    };
+    setTimeout(center, 50);
+  }
 }
 
 /* ---------- course detail ---------- */
 
 function mergeFacts(docs) {
   const merged = { grading: [], tas: [], other_key_policies: [] };
-  const keys = ["instructor","instructor_email","office_hours","location_or_modality","late_policy","attendance_policy","exam_policy","academic_integrity","textbook"];
+  const keys = ["instructor", "instructor_email", "office_hours", "location_or_modality",
+    "late_policy", "attendance_policy", "exam_policy", "academic_integrity", "textbook"];
   for (const doc of docs) {
     const f = doc.facts || {};
     for (const k of keys) if (!merged[k] && f[k]) merged[k] = f[k];
@@ -1036,6 +1206,7 @@ function renderCourse(courseId) {
   const c = courseById(courseId);
   if (!c) return navigate("dashboard");
   const docs = docsOf(courseId);
+  const notes = notesOf(courseId);
   const facts = mergeFacts(docs);
   const rows = [];
   const add = (k, v) => { if (v) rows.push({ k, v }); };
@@ -1050,9 +1221,8 @@ function renderCourse(courseId) {
   if (facts.tas.length) add("TAs", facts.tas.map((t) => [t.name, t.email].filter(Boolean).join(" · ")).join("\n"));
   add("Integrity", facts.academic_integrity);
   if (facts.other_key_policies.length) add("Worth knowing", facts.other_key_policies.join("\n"));
-  const events = db.events.filter((e) => e.course_id === courseId).sort((a, b) => a.date.localeCompare(b.date));
-  const modeChip = docs.some((d) => d.facts_mode === "ai") ? `<span class="chip accent">AI-extracted</span>`
-    : (docs.length ? `<span class="chip">auto-extracted</span>` : "");
+  const events = state.db.events.filter((e) => e.course_id === courseId)
+    .sort((a, b) => a.date.localeCompare(b.date));
 
   $("#view").innerHTML = `
     <div class="view-head">
@@ -1063,56 +1233,147 @@ function renderCourse(courseId) {
         <button class="btn" id="ask-this">💬 Ask about this course</button>
         <button class="btn danger" id="del-course">Delete</button></div>
     </div>
-    <div class="card"><h3>Course card ${modeChip}</h3>
+
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+        <h3>Skips & absences</h3>
+        <button class="btn small" id="add-allow">+ Add a tracker</button>
+      </div>
+      ${(c.allowances || []).length ? c.allowances.map((a, i) => `
+        <div class="allow-row">
+          <span>${esc(a.emoji || "🎟")} <b>${esc(a.label)}</b></span>
+          <span class="spacer"></span>
+          <button class="btn small" data-allow-use="${i}" title="Use one">−</button>
+          <span class="allow-count ${a.remaining === 0 ? "zero" : ""}">${a.remaining}/${a.total} left</span>
+          <button class="btn small" data-allow-undo="${i}" title="Give one back">+</button>
+          <button class="btn small danger" data-allow-del="${i}">✕</button>
+        </div>`).join("") : `<p class="muted">Track allowed skips: "Class skips 3/3" counts down each time you use one.</p>`}
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <h3>Course info</h3>
       ${rows.length ? `<div class="facts-grid">${rows.map((r) =>
         `<div class="fact"><div class="k">${esc(r.k)}</div><div class="v">${esc(r.v)}</div></div>`).join("")}</div>`
       : `<p class="muted">Upload a syllabus and I'll pull out the instructor, grading breakdown, late policy, and more.</p>`}
     </div>
+
+    <div class="section-title"><h3>📝 Notes & clues</h3></div>
+    <div class="card">
+      <p class="muted" style="margin-top:0">Professor dropped an exam hint? Add it here and Ask can use it later. Dates in notes go on your calendar automatically.</p>
+      <div class="note-add">
+        <textarea id="note-text" rows="2" placeholder='e.g. "Prof said prelim 2 will focus on chapters 5 to 7, especially hash tables"'></textarea>
+        <button class="btn primary" id="note-save">Add note</button>
+      </div>
+      ${notes.map((n) => `
+        <div class="note-row">
+          <div><div class="muted" style="font-size:12px">${esc((n.created_at || "").slice(0, 10))}</div>${esc(n.text)}</div>
+          <button class="btn small danger" data-del-note="${n.id}">✕</button>
+        </div>`).join("")}
+    </div>
+
     <div class="section-title"><h3>Syllabi & documents</h3>
       <button class="btn small" id="paste-btn">✏️ Paste text instead</button></div>
     <div class="card">
-      ${docs.map((d) => `<div class="doc-row">
-        <span>${d.kind === "pdf" ? "📕" : d.kind === "docx" ? "📘" : "📄"}</span>
-        <div><div class="name">${esc(d.filename)}</div>
-        <div class="meta">${esc(d.kind)} · added ${esc(d.uploaded_at)}</div></div>
-        <div class="spacer"></div>
-        <button class="btn small danger" data-del-doc="${d.id}">Remove</button></div>`).join("")
-        || `<p class="muted" style="margin:4px">No documents yet.</p>`}
+      ${docs.map((d) => `
+        <div class="doc-row doc-open" data-doc="${d.id}" title="Click to open">
+          <span>${d.kind === "pdf" ? "📕" : d.kind === "docx" ? "📘" : "📄"}</span>
+          <div><div class="name">${esc(d.filename)}</div>
+          <div class="meta">${esc(d.kind)} · added ${esc((d.uploaded_at || "").slice(0, 10))} · click to open</div></div>
+          <div class="spacer"></div>
+          <button class="btn small danger" data-del-doc="${d.id}">Remove</button>
+        </div>`).join("") || `<p class="muted" style="margin:4px">No documents yet.</p>`}
       <div class="dropzone" id="dropzone">
         <b>Drop a syllabus here</b> or <a id="browse">browse</a> — PDF, Word, or text.<br>
-        <span style="font-size:12.5px">Deadlines are auto-added to your calendar; key policies fill the course card.</span>
+        <span style="font-size:12.5px">Deadlines are auto-added to your calendar; key policies fill the course info.</span>
         <input type="file" id="file-input" accept=".pdf,.docx,.txt,.md" style="display:none">
       </div>
     </div>
+
     <div class="section-title"><h3>Deadlines from this course (${events.length})</h3></div>
     <div class="card">
-      ${events.map((e) => `<div class="ev-row"><span class="ev-date">${fmtDate(e.date)}</span>
-        <span class="kind-dot" style="background:${esc(c.color)}"></span>
-        <span>${KIND_ICONS[e.kind] || "📅"} ${esc(e.title)}${e.time ? ` <span class="muted">${esc(e.time)}</span>` : ""}</span></div>`).join("")
-        || `<p class="muted" style="margin:4px">Nothing yet — they'll appear when you upload a syllabus.</p>`}
+      ${events.map((e) => `
+        <div class="ev-row">
+          <span class="ev-date">${fmtDate(e.date)}</span>
+          <span class="kind-dot" style="background:${esc(c.color)}"></span>
+          <span>${KIND_ICONS[e.kind] || "📅"} ${esc(e.title)}${e.time ? ` <span class="muted">${esc(e.time)}</span>` : ""}</span>
+        </div>`).join("") || `<p class="muted" style="margin:4px">Nothing yet.</p>`}
     </div>`;
 
-  $("#ask-this").addEventListener("click", () => { askCourse = String(courseId); navigate("ask"); });
-  $("#del-course").addEventListener("click", () => {
-    if (!confirm(`Delete ${c.code} and all its documents/events?`)) return;
-    db.courses = db.courses.filter((x) => x.id !== courseId);
-    db.docs = db.docs.filter((x) => x.course_id !== courseId);
-    db.events = db.events.filter((x) => x.course_id !== courseId);
-    save(); toast("Course deleted."); navigate("dashboard");
+  $("#ask-this").addEventListener("click", () => { state.askCourse = String(courseId); navigate("ask"); });
+  $("#del-course").addEventListener("click", async () => {
+    if (!confirm(`Delete ${c.code} and all its documents, notes, and events?`)) return;
+    await repo.delCourse(courseId);
+    toast("Course deleted."); navigate("dashboard");
   });
-  $$("[data-del-doc]").forEach((b) => b.addEventListener("click", () => {
-    const id = Number(b.dataset.delDoc);
-    db.docs = db.docs.filter((d) => d.id !== id);
-    db.events = db.events.filter((e) => e.document_id !== id);
-    save(); toast("Document removed."); renderCourse(courseId);
+
+  const saveAllow = async () => { await repo.saveAllowances(c); renderCourse(courseId); };
+  $("#add-allow").addEventListener("click", () => openAddAllowance(c, saveAllow));
+  $$("[data-allow-use]").forEach((b) => b.addEventListener("click", () => {
+    const a = c.allowances[Number(b.dataset.allowUse)];
+    if (a && a.remaining > 0) { a.remaining--; saveAllow(); }
+  }));
+  $$("[data-allow-undo]").forEach((b) => b.addEventListener("click", () => {
+    const a = c.allowances[Number(b.dataset.allowUndo)];
+    if (a && a.remaining < a.total) { a.remaining++; saveAllow(); }
+  }));
+  $$("[data-allow-del]").forEach((b) => b.addEventListener("click", () => {
+    c.allowances.splice(Number(b.dataset.allowDel), 1);
+    saveAllow();
+  }));
+
+  $("#note-save").addEventListener("click", async () => {
+    const text = $("#note-text").value.trim();
+    if (text.length < 3) return toast("Write the note first.", "err");
+    try {
+      const added = await repo.addNote(courseId, text.slice(0, 4000));
+      toast(added ? `Note saved. ${added} deadline${added === 1 ? "" : "s"} added to your calendar.` : "Note saved.");
+      renderCourse(courseId);
+    } catch (err) { toast(err.message, "err"); }
+  });
+  $$("[data-del-note]").forEach((b) => b.addEventListener("click", async () => {
+    await repo.delNote(b.dataset.delNote);
+    renderCourse(courseId);
+  }));
+
+  $$(".doc-open").forEach((row) => row.addEventListener("click", () => openDocViewer(row.dataset.doc)));
+  $$("[data-del-doc]").forEach((b) => b.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    await repo.delDocument(b.dataset.delDoc);
+    toast("Document removed."); renderCourse(courseId);
   }));
   $("#paste-btn").addEventListener("click", () => openPaste(courseId));
+
   const dz = $("#dropzone"), fi = $("#file-input");
   $("#browse").addEventListener("click", () => fi.click());
   fi.addEventListener("change", () => fi.files[0] && uploadFile(courseId, fi.files[0]));
   ["dragover", "dragenter"].forEach((n) => dz.addEventListener(n, (e) => { e.preventDefault(); dz.classList.add("drag"); }));
   ["dragleave", "drop"].forEach((n) => dz.addEventListener(n, (e) => { e.preventDefault(); dz.classList.remove("drag"); }));
   dz.addEventListener("drop", (e) => { const f = e.dataTransfer.files && e.dataTransfer.files[0]; if (f) uploadFile(courseId, f); });
+}
+
+function openAddAllowance(course, onSave) {
+  openModal(`
+    <h3>Add a tracker</h3>
+    <div class="field"><label>What is it?</label>
+      <select id="al-type">
+        <option>Class skips</option><option>Homework skips</option><option>Lab skips</option><option>Custom…</option>
+      </select></div>
+    <div class="field hidden" id="al-custom-row"><label>Custom name</label><input id="al-custom" placeholder="Excused absences"></div>
+    <div class="field"><label>How many are allowed?</label><input id="al-total" type="number" min="1" max="99" value="3"></div>
+    <div class="modal-actions"><button class="btn" id="al-cancel">Cancel</button>
+    <button class="btn primary" id="al-save">Add</button></div>`);
+  $("#al-type").addEventListener("change", (e) => {
+    $("#al-custom-row").classList.toggle("hidden", e.target.value !== "Custom…");
+  });
+  $("#al-cancel").addEventListener("click", closeModal);
+  $("#al-save").addEventListener("click", () => {
+    const type = $("#al-type").value;
+    const label = type === "Custom…" ? ($("#al-custom").value.trim().slice(0, 30) || "Skips") : type;
+    const total = Math.max(1, Math.min(99, parseInt($("#al-total").value, 10) || 3));
+    (course.allowances = course.allowances || []).push({
+      label, emoji: ALLOW_EMOJI[label] || "🎟", total, remaining: total });
+    closeModal(); onSave();
+  });
 }
 
 async function uploadFile(courseId, file) {
@@ -1152,85 +1413,154 @@ function openPaste(courseId) {
 const SUGGESTIONS = ["When is my next exam?", "What's the late policy for homework?", "How many lectures can I miss?",
   "Is there any extra credit?", "What should I do if I'm sick on an exam day?"];
 
-function renderAsk() {
-  const options = [`<option value="">All courses</option>`]
-    .concat(db.courses.map((c) => `<option value="${c.id}" ${String(c.id) === askCourse ? "selected" : ""}>${esc(c.code)}</option>`));
+function scopeChipsHtml() {
+  const allSel = !state.askCourse;
+  return `<div class="scope-chips">
+    <span class="scope-chip ${allSel ? "sel" : ""}" data-course="">All courses</span>
+    ${state.db.courses.map((c) => `<span class="scope-chip ${String(c.id) === state.askCourse ? "sel" : ""}"
+      data-course="${c.id}" style="${String(c.id) === state.askCourse ? `background:${esc(c.color)};border-color:${esc(c.color)};color:#fff` : ""}">${esc(c.code)}</span>`).join("")}
+  </div>`;
+}
+
+async function renderAsk() {
+  const session = await repo.ensureSession();
+  state.currentSessionId = session.id;
+  const displayedId = state.viewingSessionId || state.currentSessionId;
+  const isOld = Boolean(state.viewingSessionId) && state.viewingSessionId !== state.currentSessionId;
+  let messages = [];
+  try { messages = await repo.listChats(displayedId); } catch (_e) { messages = []; }
+  if (!isOld) state.msgs = messages.map((m) => ({ question: m.question, answer: m.answer, course_id: m.course_id }));
+  const sessions = state.db.sessions.filter((s) => (s.title || "").length || s.id === state.currentSessionId);
+  const scopedCourse = state.askCourse ? courseById(state.askCourse) : null;
+
   $("#view").innerHTML = `
     <div class="view-head">
       <div><h1>Ask your syllabi</h1>
-      <div class="sub">Answers come only from what you've uploaded — with quotes to prove it. If it's not in there, I'll say so.</div></div>
-      ${db.chats.length ? `<button class="btn small" id="clear-chats">Clear history</button>` : ""}
+      <div class="sub">Answers come only from what you've uploaded, with quotes to prove it. Not in there? I say so.</div></div>
+      ${REMOTE && state.usage.on ? `<span class="chip" id="ai-counter" title="Resets at midnight UTC">🔋 ${state.usage.left}/${state.usage.limit} AI answers left today</span>` : ""}
     </div>
-    <div class="chat-wrap">
-      <div class="chat-scroll" id="chat-scroll">
-        ${db.chats.length ? db.chats.map(renderExchange).join("") : `
-          <div class="empty"><div class="big-ic">💬</div>Try one of these:</div>
-          <div class="suggestions" style="justify-content:center">
-            ${SUGGESTIONS.map((s) => `<span class="sug">${esc(s)}</span>`).join("")}</div>`}
+    <div class="ask-layout">
+      <div class="chat-side">
+        <button class="btn small wide" id="new-chat">＋ New chat</button>
+        <div class="chat-side-title">Chats</div>
+        ${sessions.map((s) => `
+          <div class="chat-item ${s.id === displayedId ? "active" : ""}" data-session="${s.id}">
+            <div class="ci-title">${esc(s.title || "New chat")}</div>
+            <div class="ci-date">${esc((s.started_at || "").slice(5, 10).replace("-", "/"))}</div>
+          </div>`).join("") || `<p class="muted" style="font-size:12px">No chats yet.</p>`}
       </div>
-      <div class="ask-bar"><form class="ask-box" id="ask-form">
-        <select id="ask-course">${options.join("")}</select>
-        <input id="ask-input" placeholder="e.g. Can I use my slip days on labs?" autocomplete="off">
-        <button class="btn primary" id="ask-send" type="submit">Ask</button>
-      </form></div>
+      <div class="chat-wrap">
+        ${isOld ? `<div class="old-banner">Viewing an old chat · <a id="back-current">back to current</a></div>` : ""}
+        <div class="chat-scroll" id="chat-scroll">
+          ${messages.length ? messages.map((m) => renderExchange(m)).join("") : `
+            <div class="empty"><div class="big-ic">💬</div>Try one of these:</div>
+            <div class="suggestions" style="justify-content:center">
+              ${SUGGESTIONS.map((s) => `<span class="sug">${esc(s)}</span>`).join("")}</div>`}
+        </div>
+        ${isOld ? "" : `
+        <div class="ask-bar">
+          ${scopeChipsHtml()}
+          <form class="ask-box" id="ask-form" style="${scopedCourse ? `border-color:${esc(scopedCourse.color)}` : ""}">
+            <input id="ask-input" placeholder="${scopedCourse ? `Asking about ${esc(scopedCourse.code)}…` : "Ask across all courses…"}" autocomplete="off">
+            <button class="btn primary" id="ask-send" type="submit">Ask</button>
+          </form>
+        </div>`}
+      </div>
     </div>`;
+
   $$(".sug").forEach((sug) => sug.addEventListener("click", () => { $("#ask-input").value = sug.textContent; submitAsk(); }));
-  $("#ask-form").addEventListener("submit", (e) => { e.preventDefault(); submitAsk(); });
-  $("#ask-course").addEventListener("change", (e) => { askCourse = e.target.value; });
-  const clearBtn = $("#clear-chats");
-  if (clearBtn) clearBtn.addEventListener("click", () => { db.chats = []; save(); renderAsk(); });
+  const form = $("#ask-form");
+  if (form) form.addEventListener("submit", (e) => { e.preventDefault(); submitAsk(); });
+  $$(".scope-chip").forEach((chip) => chip.addEventListener("click", () => {
+    state.askCourse = chip.dataset.course;
+    const typed = $("#ask-input") ? $("#ask-input").value : "";
+    renderAsk().then(() => {
+      const input = $("#ask-input");
+      if (input) { input.value = typed; input.focus(); }
+    });
+  }));
+  $("#new-chat").addEventListener("click", async () => {
+    chatMarker(true);
+    state.viewingSessionId = null;
+    state.msgs = [];
+    renderAsk();
+  });
+  $$(".chat-item").forEach((item) => item.addEventListener("click", () => {
+    const id = item.dataset.session;
+    state.viewingSessionId = id === state.currentSessionId ? null : id;
+    renderAsk();
+  }));
+  const back = $("#back-current");
+  if (back) back.addEventListener("click", () => { state.viewingSessionId = null; renderAsk(); });
   bindAnswerActions();
   window.scrollTo(0, document.body.scrollHeight);
 }
 
-function renderExchange(chat) {
-  return `<div class="msg-q">${esc(chat.question)}</div><div class="msg-a">${renderAnswer(chat.answer, chat)}</div>`;
+function renderExchange(msg) {
+  return `<div class="msg-q">${esc(msg.question)}</div><div class="msg-a">${renderAnswer(msg.answer, msg)}</div>`;
 }
 
-function renderAnswer(a, chat) {
+function renderAnswer(a, msg) {
   const statusPill = a.status === "answered" ? `<span class="pill ok">✓ From your materials</span>`
     : a.status === "partial" ? `<span class="pill warn">◐ Partly covered</span>`
     : `<span class="pill bad">✕ Not in your materials</span>`;
   const routeLabels = { none: "📗 No email needed", ta: "🧑‍💻 Ask your TA", professor: "🎓 Ask your professor",
     classmate_or_lms: "👥 Classmate / course site", registrar_or_advisor: "🏛 Registrar / advisor" };
-  const conf = a.mode === "ai" && a.confidence ? `<span class="pill" style="background:var(--slate-soft);color:var(--ink-soft)">confidence: ${esc(a.confidence)}</span>` : "";
-  const cites = (a.citations || []).map((c) => `<div class="cite">
-      <div class="src">📖 ${esc(c.label)} ${c.verified === false ? `<span class="unverified" title="This quote couldn't be matched verbatim to your documents.">⚠ unverified</span>` : ""}</div>
-      <div class="quote">“${esc(c.quote)}”</div></div>`).join("");
+  const showRouteReason = a.route !== "none" && a.route_reason;
+  const scopeChip = a.scope_note ? `<span class="chip">🎯 ${esc(a.scope_note)}</span>` : "";
+  const cites = (a.citations || []).map((c) => `
+    <div class="cite">
+      <div class="src">📖 ${esc(c.label)}
+        ${c.verified === false ? `<span class="unverified" title="This quote couldn't be matched verbatim to your documents.">⚠ unverified</span>` : ""}
+        ${c.doc_id != null ? `<button class="btn small show-src" data-doc="${esc(String(c.doc_id))}" data-q="${esc(c.quote)}">📍 Show source</button>` : ""}
+      </div>
+      <div class="quote">“${esc(c.quote.length > 150 ? c.quote.slice(0, 150) + "…" : c.quote)}”</div>
+    </div>`).join("");
   const citeLabel = ((a.citations || [])[0] || {}).label || "";
   const emailBtn = (a.route === "ta" || a.route === "professor")
-    ? `<button class="btn small draft-email" data-q="${esc(chat.question)}" data-route="${a.route}"
-        data-course="${chat.course_id || ""}" data-citelabel="${esc(citeLabel)}"
+    ? `<button class="btn small draft-email" data-q="${esc(msg.question)}" data-route="${a.route}"
+        data-course="${msg.course_id || ""}" data-citelabel="${esc(citeLabel)}"
         data-ctx="${esc(((a.citations || []).map((c) => c.quote).join(" … ") + " " + (a.answer || "")).slice(0, 2000))}">
         ✉️ Draft the email for me</button>` : "";
   return `<div class="answer-card">
-    <div class="answer-top">${statusPill}<span class="pill route-${esc(a.route)}">${routeLabels[a.route] || esc(a.route)}</span>${conf}</div>
+    <div class="answer-top">${statusPill}<span class="pill route-${esc(a.route)}">${routeLabels[a.route] || esc(a.route)}</span>${scopeChip}</div>
     <div class="answer-text">${esc(a.answer)}</div>
-    ${a.unverified ? `<div class="mode-note">⚠ Heads up: I couldn't verify this answer's quotes against your documents — double-check before relying on it.</div>` : ""}
-    ${a.route_reason ? `<div class="route-reason"><b>Who to ask:</b> ${esc(a.route_reason)}</div>` : ""}
-    ${cites ? `<details class="cites" ${a.mode === "heuristic" ? "open" : ""}><summary>${(a.citations || []).length} source ${a.mode === "heuristic" ? "passage" : "quote"}${(a.citations || []).length === 1 ? "" : "s"} from your documents</summary>${cites}</details>` : ""}
+    ${a.unverified ? `<div class="mode-note">⚠ Couldn't verify this answer's quotes against your documents. Double-check before relying on it.</div>` : ""}
+    ${showRouteReason ? `<div class="route-reason"><b>Who to ask:</b> ${esc(a.route_reason)}</div>` : ""}
+    ${cites ? `<details class="cites"><summary>Sources (${(a.citations || []).length})</summary>${cites}</details>` : ""}
     ${a.note ? `<div class="mode-note">${esc(a.note)}</div>` : ""}
-    ${a.mode === "heuristic" && !a.note ? `<div class="mode-note">Keyword mode (no API key set) — showing best-matching passages rather than a written answer. Add a key in Settings for full answers.</div>` : ""}
     <div class="answer-actions">${emailBtn}</div></div>`;
 }
 
 function bindAnswerActions() {
   $$(".draft-email").forEach((btn) => btn.addEventListener("click", () => {
-    let courseId = btn.dataset.course ? Number(btn.dataset.course) : null;
+    let courseId = btn.dataset.course || null;
     if (!courseId && btn.dataset.citelabel) {
       const code = btn.dataset.citelabel.split(" — ")[0].trim();
-      const match = db.courses.find((c) => c.code === code);
+      const match = state.db.courses.find((c) => c.code === code);
       if (match) courseId = match.id;
     }
     openEmailDraft({ question: btn.dataset.q, recipient: btn.dataset.route, course_id: courseId, context: btn.dataset.ctx });
+  }));
+  $$(".show-src").forEach((btn) => btn.addEventListener("click", () => {
+    openDocViewer(btn.dataset.doc, btn.dataset.q);
   }));
 }
 
 async function submitAsk() {
   const input = $("#ask-input");
+  if (!input) return;
   const question = input.value.trim();
   if (!question) return;
-  const courseId = $("#ask-course").value ? Number($("#ask-course").value) : null;
+
+  let courseId = state.askCourse || null;
+  let scopeNote = "";
+  const detected = detectCourseMention(question);
+  if (detected && detected !== courseId) {
+    courseId = detected;
+    scopeNote = `Scoped to ${courseById(detected).code} because you mentioned it`;
+  }
+
   const scroll = $("#chat-scroll");
   if (scroll.querySelector(".empty")) scroll.innerHTML = "";
   scroll.insertAdjacentHTML("beforeend",
@@ -1239,22 +1569,56 @@ async function submitAsk() {
   $("#ask-send").disabled = true;
   window.scrollTo(0, document.body.scrollHeight);
   try {
-    const answer = await doAsk(question, courseId);
+    const answer = await doAsk(question, courseId, scopeNote);
     $("#thinking").outerHTML = `<div class="msg-a">${renderAnswer(answer, { question, course_id: courseId })}</div>`;
     bindAnswerActions();
+    const counter = $("#ai-counter");
+    if (counter && state.usage.on) counter.textContent = `🔋 ${state.usage.left}/${state.usage.limit} AI answers left today`;
   } catch (err) {
     $("#thinking").outerHTML = `<div class="msg-a"><div class="answer-card"><span class="pill bad">✕ ${esc(err.message)}</span></div></div>`;
   } finally {
-    $("#ask-send").disabled = false;
+    const send = $("#ask-send");
+    if (send) send.disabled = false;
     window.scrollTo(0, document.body.scrollHeight);
   }
 }
 
 async function openEmailDraft(payload) {
-  openModal(`<h3>Drafting your email…</h3><p class="muted">Grounded in your syllabus — nothing invented.</p>`);
-  const draft = await draftEmail(payload);
+  openModal(`<h3>Drafting your email…</h3><p class="muted">Grounded in your syllabus. Nothing invented.</p>`);
+  let draft = null;
+  const course = payload.course_id ? courseById(payload.course_id) : null;
+  const code = course ? course.code : "your class";
+  if (REMOTE && state.usage.on) {
+    try {
+      const res = await repo.invokeClaude({ kind: "draft", question: payload.question, code,
+        recipient: payload.recipient, context: payload.context, student: state.user ? state.user.name : "[your name]" });
+      if (res && res.result) draft = { ...res.result, mode: "ai" };
+    } catch (_e) { /* template below */ }
+  }
+  if (!draft) {
+    let toHint = "";
+    if (course) {
+      for (const d of docsOf(course.id)) {
+        if (!d.facts) continue;
+        if (payload.recipient === "ta" && d.facts.tas && d.facts.tas.length) toHint = d.facts.tas[0].email || "";
+        if (!toHint) toHint = d.facts.instructor_email || "";
+        if (toHint) break;
+      }
+    }
+    const words = payload.question.split(/\s+/);
+    const topic = words.slice(0, 9).join(" ") + (words.length > 9 ? "…" : "");
+    const student = state.user ? state.user.name : "[Your name]";
+    draft = {
+      mode: "template",
+      subject: (course ? `[${code}] ` : "") + (topic ? `Question: ${topic}` : "Quick question"),
+      to_hint: toHint || (payload.recipient === "ta" ? "your TA (see course site)" : "your instructor"),
+      body: `Dear ${payload.recipient === "professor" ? "Professor [name]" : "[TA's name]"},\n\n` +
+        `${course ? `I'm in your ${code} class this term.` : "I'm in your class this term."} I checked the syllabus first, but I still wanted to ask: ${payload.question}\n\n` +
+        `[One sentence of context: your situation, section, or dates.]\n\nThank you,\n${student}`,
+    };
+  }
   openModal(`
-    <h3>✉️ Email draft <span class="chip">${draft.mode === "ai" ? "AI" : "template"}</span></h3>
+    <h3>✉️ Email draft</h3>
     <div class="field"><label>To</label><input id="em-to" value="${esc(draft.to_hint)}"></div>
     <div class="field"><label>Subject</label><input id="em-subject" value="${esc(draft.subject)}"></div>
     <div class="field"><label>Body</label><textarea id="em-body" rows="10">${esc(draft.body)}</textarea></div>
@@ -1265,25 +1629,25 @@ async function openEmailDraft(payload) {
   $("#em-copy").addEventListener("click", async () => {
     try {
       await navigator.clipboard.writeText(`Subject: ${$("#em-subject").value}\n\n${$("#em-body").value}`);
-      toast("Copied — paste it into your email app.");
-    } catch (_e) { toast("Couldn't access clipboard — select and copy manually.", "err"); }
+      toast("Copied. Paste it into your email app.");
+    } catch (_e) { toast("Couldn't access clipboard. Select and copy manually.", "err"); }
   });
 }
 
 /* ---------- calendar ---------- */
 
 function renderCalendar() {
-  if (!calMonth) { const now = new Date(); calMonth = new Date(now.getFullYear(), now.getMonth(), 1); }
-  const year = calMonth.getFullYear(), month = calMonth.getMonth();
-  const monthName = calMonth.toLocaleDateString(undefined, { month: "long", year: "numeric" });
+  if (!state.calMonth) { const now = new Date(); state.calMonth = new Date(now.getFullYear(), now.getMonth(), 1); }
+  const year = state.calMonth.getFullYear(), month = state.calMonth.getMonth();
+  const monthName = state.calMonth.toLocaleDateString(undefined, { month: "long", year: "numeric" });
   const byDate = {};
-  for (const e of db.events) (byDate[e.date] = byDate[e.date] || []).push(e);
+  for (const e of state.db.events) (byDate[e.date] = byDate[e.date] || []).push(e);
   const firstDow = new Date(year, month, 1).getDay();
   const cells = [];
   for (let i = 0; i < 42; i++) {
     const d = new Date(year, month, 1 - firstDow + i);
     const iso = isoOf(d);
-    const evs = (byDate[iso] || []);
+    const evs = byDate[iso] || [];
     cells.push(`<div class="cal-cell ${d.getMonth() !== month ? "dim" : ""} ${iso === isoToday() ? "today" : ""}" data-date="${iso}">
       <div class="dnum">${d.getDate()}</div>
       ${evs.slice(0, 3).map((e) => {
@@ -1292,11 +1656,11 @@ function renderCalendar() {
       }).join("")}
       ${evs.length > 3 ? `<div class="cal-more">+${evs.length - 3} more</div>` : ""}</div>`);
   }
-  const dayEvents = selectedDay ? (byDate[selectedDay] || []) : [];
+  const dayEvents = state.selectedDay ? (byDate[state.selectedDay] || []) : [];
 
   $("#view").innerHTML = `
     <div class="view-head">
-      <div><h1>Calendar</h1><div class="sub">Every deadline pulled from your syllabi, plus anything you add or import.</div></div>
+      <div><h1>Calendar</h1><div class="sub">Every deadline pulled from your syllabi and notes, plus anything you add or import.</div></div>
       <div style="display:flex;gap:8px;flex-wrap:wrap">
         <button class="btn" id="import-ics">⇪ Import .ics</button>
         <button class="btn" id="export-ics">⬇ Export .ics</button>
@@ -1310,7 +1674,7 @@ function renderCalendar() {
       ${["Sun","Mon","Tue","Wed","Thu","Fri","Sat"].map((d) => `<div class="cal-dow">${d}</div>`).join("")}
       ${cells.join("")}
     </div>
-    ${selectedDay ? `<div class="card day-panel"><h3>${fmtDate(selectedDay)}</h3>
+    ${state.selectedDay ? `<div class="card day-panel"><h3>${fmtDate(state.selectedDay)}</h3>
       ${dayEvents.length ? dayEvents.map((e) => {
         const c = e.course_id ? courseById(e.course_id) : null;
         return `<div class="ev-row"><span class="kind-dot" style="background:${esc(c ? c.color : "#64748b")}"></span>
@@ -1321,31 +1685,31 @@ function renderCalendar() {
           <button class="btn small danger" data-del-ev="${e.id}">Remove</button></div>`;
       }).join("") : `<p class="muted">Nothing on this day.</p>`}</div>` : ""}`;
 
-  $("#cal-prev").addEventListener("click", () => { calMonth = new Date(year, month - 1, 1); renderCalendar(); });
-  $("#cal-next").addEventListener("click", () => { calMonth = new Date(year, month + 1, 1); renderCalendar(); });
-  $("#cal-today").addEventListener("click", () => { const now = new Date(); calMonth = new Date(now.getFullYear(), now.getMonth(), 1); renderCalendar(); });
-  $$(".cal-cell").forEach((cell) => cell.addEventListener("click", () => { selectedDay = cell.dataset.date; renderCalendar(); }));
-  $$("[data-del-ev]").forEach((b) => b.addEventListener("click", (e) => {
+  $("#cal-prev").addEventListener("click", () => { state.calMonth = new Date(year, month - 1, 1); renderCalendar(); });
+  $("#cal-next").addEventListener("click", () => { state.calMonth = new Date(year, month + 1, 1); renderCalendar(); });
+  $("#cal-today").addEventListener("click", () => { const now = new Date(); state.calMonth = new Date(now.getFullYear(), now.getMonth(), 1); renderCalendar(); });
+  $$(".cal-cell").forEach((cell) => cell.addEventListener("click", () => { state.selectedDay = cell.dataset.date; renderCalendar(); }));
+  $$("[data-del-ev]").forEach((b) => b.addEventListener("click", async (e) => {
     e.stopPropagation();
-    db.events = db.events.filter((ev) => ev.id !== Number(b.dataset.delEv));
-    save(); renderCalendar();
+    await repo.delEvent(b.dataset.delEv);
+    renderCalendar();
   }));
   $("#add-event").addEventListener("click", openAddEvent);
   $("#import-ics").addEventListener("click", openImportIcs);
   $("#export-ics").addEventListener("click", () => {
-    const blob = new Blob([generateIcs(db.events, "MySyllabi")], { type: "text/calendar" });
+    const blob = new Blob([generateIcs(state.db.events, "MySyllabi")], { type: "text/calendar" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
     a.download = "mysyllabi.ics";
     a.click();
     URL.revokeObjectURL(a.href);
-    toast("Downloaded — import it into Google/Apple/Outlook calendar.");
+    toast("Downloaded. Import it into Google/Apple/Outlook calendar.");
   });
 }
 
 function courseOptions() {
   return [`<option value="">(no course)</option>`]
-    .concat(db.courses.map((c) => `<option value="${c.id}">${esc(c.code)}</option>`)).join("");
+    .concat(state.db.courses.map((c) => `<option value="${c.id}">${esc(c.code)}</option>`)).join("");
 }
 
 function openAddEvent() {
@@ -1353,7 +1717,7 @@ function openAddEvent() {
     <h3>Add event</h3>
     <div class="field"><label>Title *</label><input id="ne-title" placeholder="Essay 2 due"></div>
     <div class="row">
-      <div class="field"><label>Date *</label><input id="ne-date" type="date" value="${selectedDay || isoToday()}"></div>
+      <div class="field"><label>Date *</label><input id="ne-date" type="date" value="${state.selectedDay || isoToday()}"></div>
       <div class="field"><label>Time</label><input id="ne-time" type="time"></div></div>
     <div class="row">
       <div class="field"><label>Type</label><select id="ne-kind">
@@ -1364,20 +1728,22 @@ function openAddEvent() {
     <div class="modal-actions"><button class="btn" id="ne-cancel">Cancel</button>
     <button class="btn primary" id="ne-save">Add</button></div>`);
   $("#ne-cancel").addEventListener("click", closeModal);
-  $("#ne-save").addEventListener("click", () => {
+  $("#ne-save").addEventListener("click", async () => {
     const title = $("#ne-title").value.trim().slice(0, 140);
     const date = $("#ne-date").value;
     if (!title || !/^\d{4}-\d{2}-\d{2}$/.test(date)) return toast("An event needs a title and a date.", "err");
-    db.events.push({ id: uid(), course_id: $("#ne-course").value ? Number($("#ne-course").value) : null,
-      title, date, time: $("#ne-time").value || "", kind: $("#ne-kind").value, source: "manual", details: "" });
-    save(); closeModal(); toast("Event added."); renderCalendar();
+    try {
+      await repo.addEvent({ course_id: $("#ne-course").value || null, title, date,
+        time: $("#ne-time").value || "", kind: $("#ne-kind").value, source: "manual", details: "" });
+      closeModal(); toast("Event added."); renderCalendar();
+    } catch (err) { toast(err.message, "err"); }
   });
 }
 
 function openImportIcs() {
   openModal(`
     <h3>Import a course calendar</h3>
-    <p class="muted">Canvas, Moodle & co. give every student a calendar export (look for "Calendar feed" / .ics). Download the .ics file and upload it here. (Pasting a feed URL usually gets blocked by the school's server when done from a browser, so the file route is the reliable one.)</p>
+    <p class="muted">Canvas, Moodle & co. give every student a calendar export (look for "Calendar feed" / .ics). Download the .ics file and upload it here.</p>
     <div class="field"><label>.ics file</label><input id="ic-file" type="file" accept=".ics"></div>
     <div class="field"><label>Attach to course (optional)</label><select id="ic-course">${courseOptions()}</select></div>
     <div class="modal-actions"><button class="btn" id="ic-cancel">Cancel</button>
@@ -1387,78 +1753,139 @@ function openImportIcs() {
     const file = $("#ic-file").files[0];
     if (!file) return toast("Choose a .ics file first.", "err");
     const events = parseIcs(await file.text());
-    if (!events.length) return toast("No usable events found in that calendar (or all fall outside the current term window).", "err");
-    const courseId = $("#ic-course").value ? Number($("#ic-course").value) : null;
-    const added = addEvents(courseId, null, events, "ics");
-    save(); closeModal();
-    toast(`Imported ${added} of ${events.length} events.`);
-    renderCalendar();
+    if (!events.length) return toast("No usable events found in that calendar.", "err");
+    try {
+      const added = await repo.addEventsBulk($("#ic-course").value || null, null, events, "ics");
+      closeModal(); toast(`Imported ${added} of ${events.length} events.`); renderCalendar();
+    } catch (err) { toast(err.message, "err"); }
   });
 }
 
 /* ---------- settings ---------- */
 
 function renderSettings() {
+  const theme = localStorage.getItem("msy-theme") || "light";
   $("#view").innerHTML = `
     <div class="view-head"><div><h1>Settings</h1></div></div>
     <div class="settings-grid">
       <div class="card">
-        <h3>${db.apiKey ? "✅ AI answers are on" : "🔌 AI answers are off"}</h3>
-        <div class="kv"><span class="k">Mode</span><span>${db.apiKey ? `Full answers via <b>${MODEL}</b>, restricted to your uploads` : "Keyword matching over your uploads (no AI)"}</span></div>
-        <div class="field" style="margin-top:12px"><label>Anthropic API key</label>
-          <input id="key-input" type="password" placeholder="sk-ant-…" value="${esc(db.apiKey)}"></div>
-        <div style="display:flex;gap:8px">
-          <button class="btn primary" id="key-save">Save key</button>
-          ${db.apiKey ? `<button class="btn danger" id="key-clear">Remove key</button>` : ""}
+        <h3>🎨 Appearance</h3>
+        <div style="display:flex;gap:8px;margin-top:10px">
+          <button class="btn ${theme === "light" ? "primary" : ""}" id="theme-light">☀️ Light</button>
+          <button class="btn ${theme === "dark" ? "primary" : ""}" id="theme-dark">🌙 Dark</button>
         </div>
-        <p class="muted" style="margin-top:10px">The key is stored only in this browser and sent only to Anthropic's API. Don't enter it on shared computers. Get one at console.anthropic.com — without it, everything still works in keyword mode.</p>
       </div>
       <div class="card">
-        <h3>💾 Your data</h3>
-        <p class="muted">Everything lives in this browser. Back it up to a file, move it to another device, or wipe it.</p>
-        <div style="display:flex;gap:8px;flex-wrap:wrap">
-          <button class="btn" id="backup">⬇ Download backup</button>
-          <button class="btn" id="restore">⇪ Restore backup</button>
-          <button class="btn danger" id="wipe">Erase everything</button>
-          <input id="restore-file" type="file" accept=".json" style="display:none">
-        </div>
+        <h3>👤 Account</h3>
+        ${REMOTE ? `
+          <div class="kv"><span class="k">Name</span><span>${esc(state.user.name)}</span></div>
+          <div class="kv"><span class="k">Email</span><span>${esc(state.user.email)}</span></div>
+          ${state.usage.on ? `<div class="kv"><span class="k">AI answers</span><span>${state.usage.left} of ${state.usage.limit} left today</span></div>` : ""}
+          <div style="display:flex;gap:8px;margin-top:12px">
+            <button class="btn" id="clear-history">Clear Q&A history</button>
+            <button class="btn danger" id="logout">Sign out</button>
+          </div>` : `
+          <p class="muted">Demo mode. Data lives only in this browser; there is no account.</p>
+          <div style="display:flex;gap:8px;margin-top:12px">
+            <button class="btn" id="clear-history">Clear Q&A history</button>
+            <button class="btn danger" id="wipe">Erase everything</button>
+          </div>`}
       </div>
     </div>`;
 
-  $("#key-save").addEventListener("click", () => {
-    db.apiKey = $("#key-input").value.trim();
-    save(); renderAiPill();
-    toast(db.apiKey ? "Key saved — AI answers are on. It'll be checked on your next question." : "Key cleared.");
-    renderSettings();
+  $("#theme-light").addEventListener("click", () => { applyTheme("light"); renderSettings(); });
+  $("#theme-dark").addEventListener("click", () => { applyTheme("dark"); renderSettings(); });
+  $("#clear-history").addEventListener("click", async () => {
+    await repo.clearChats();
+    toast("History cleared.");
   });
-  const clearBtn = $("#key-clear");
-  if (clearBtn) clearBtn.addEventListener("click", () => { db.apiKey = ""; save(); renderAiPill(); renderSettings(); });
-  $("#backup").addEventListener("click", () => {
-    const blob = new Blob([JSON.stringify({ ...db, apiKey: "" }, null, 1)], { type: "application/json" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = "mysyllabi-backup.json";
-    a.click();
-    URL.revokeObjectURL(a.href);
+  const logout = $("#logout");
+  if (logout) logout.addEventListener("click", async () => {
+    await supa.auth.signOut();
+    location.reload();
   });
-  $("#restore").addEventListener("click", () => $("#restore-file").click());
-  $("#restore-file").addEventListener("change", async (e) => {
-    try {
-      const data = JSON.parse(await e.target.files[0].text());
-      if (!Array.isArray(data.courses)) throw new Error("not a MySyllabi backup");
-      const key = db.apiKey;
-      db = { ...freshDb(), ...data, apiKey: key };
-      save(); toast("Backup restored."); navigate("dashboard");
-    } catch (err) { toast(`Couldn't restore: ${err.message}`, "err"); }
-  });
-  $("#wipe").addEventListener("click", () => {
-    if (!confirm("Erase ALL courses, documents, events, and history from this browser?")) return;
-    db = freshDb(); save(); toast("Wiped."); navigate("dashboard");
+  const wipe = $("#wipe");
+  if (wipe) wipe.addEventListener("click", () => {
+    if (!confirm("Erase ALL courses, documents, notes, events, and history from this browser?")) return;
+    localDb = { courses: [], docs: [], events: [], notes: [], sessions: [], chats: [] };
+    localSave();
+    state.db = { courses: [], docs: [], events: [], notes: [], sessions: [] };
+    toast("Wiped."); navigate("dashboard");
   });
 }
 
-/* ================= boot ================= */
+/* ================= auth & boot ================= */
+
+let authMode = "login";
+
+function setAuthMode(mode) {
+  authMode = mode;
+  $("#auth-name-row").classList.toggle("hidden", mode === "login");
+  $("#auth-submit").textContent = mode === "login" ? "Sign in" : "Create account";
+  $("#auth-toggle-text").textContent = mode === "login" ? "New here?" : "Already have an account?";
+  $("#auth-toggle-link").textContent = mode === "login" ? "Create an account" : "Sign in instead";
+  $("#auth-error").textContent = "";
+}
+$("#auth-toggle-link").addEventListener("click", (e) => {
+  e.preventDefault();
+  setAuthMode(authMode === "login" ? "register" : "login");
+});
+$("#auth-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const btn = $("#auth-submit");
+  btn.disabled = true;
+  $("#auth-error").textContent = "";
+  try {
+    const email = $("#auth-email").value.trim();
+    const password = $("#auth-password").value;
+    if (authMode === "register") {
+      const name = $("#auth-name").value.trim() || email.split("@")[0];
+      const { data, error } = await supa.auth.signUp({ email, password, options: { data: { name } } });
+      if (error) throw error;
+      if (!data.session) {
+        $("#auth-error").textContent = "Check your email to confirm the account, then sign in.";
+        setAuthMode("login");
+        return;
+      }
+    } else {
+      const { error } = await supa.auth.signInWithPassword({ email, password });
+      if (error) throw error;
+    }
+    await enterApp();
+  } catch (err) {
+    $("#auth-error").textContent = err.message || String(err);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+async function enterApp() {
+  $("#auth").classList.add("hidden");
+  $("#app").classList.remove("hidden");
+  if (REMOTE) {
+    const { data } = await supa.auth.getUser();
+    const u = data.user;
+    state.user = { id: u.id, email: u.email, name: (u.user_metadata && u.user_metadata.name) || u.email.split("@")[0] };
+    $("#whoami").textContent = `${state.user.name} · ${state.user.email}`;
+    repo.invokeClaude({ kind: "status" }).catch(() => { /* pill stays keyword mode */ });
+  } else {
+    $("#whoami").textContent = "🔒 Demo: everything stays in this browser";
+  }
+  renderAiPill();
+  await repo.loadAll();
+  navigate("dashboard");
+}
 
 $$("#nav .nav-item").forEach((a) => a.addEventListener("click", () => navigate(a.dataset.view)));
-renderAiPill();
-navigate("dashboard");
+
+async function boot() {
+  renderAiPill();
+  if (!REMOTE) {
+    await enterApp();
+    return;
+  }
+  const { data } = await supa.auth.getSession();
+  if (data.session) await enterApp();
+  else $("#auth").classList.remove("hidden");
+}
+boot();

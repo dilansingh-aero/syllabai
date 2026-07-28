@@ -6,13 +6,44 @@
 <title>MySyllabi — your syllabi, answered</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%8E%93%3C/text%3E%3C/svg%3E">
 <link rel="stylesheet" href="./styles.css">
-<!-- In-browser file readers (only needed for .pdf / .docx uploads; txt & paste work without them) -->
+<script>document.documentElement.dataset.theme = localStorage.getItem("msy-theme") || "light";</script>
 <script defer src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/mammoth@1.8.0/mammoth.browser.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
 </head>
 <body>
 
-<div id="app" class="app">
+<div id="auth" class="auth-wrap hidden">
+  <div class="auth-card">
+    <div class="logo big">
+      <svg viewBox="0 0 24 24" width="34" height="34" aria-hidden="true"><path fill="currentColor" d="M12 3 1 8l11 5 9-4.09V15h2V8L12 3zM5 13.18v3.64C5 18.6 8.13 20 12 20s7-1.4 7-3.18v-3.64l-7 3.18-7-3.18z"/></svg>
+      <span>MySyllabi</span>
+    </div>
+    <p class="tagline">Upload your syllabi once. Stop emailing your professor questions the syllabus already answers.</p>
+    <form id="auth-form">
+      <div id="auth-name-row" class="field hidden">
+        <label for="auth-name">Your name</label>
+        <input id="auth-name" type="text" autocomplete="name" placeholder="Sam Student">
+      </div>
+      <div class="field">
+        <label for="auth-email">Email</label>
+        <input id="auth-email" type="email" autocomplete="username" required placeholder="you@school.edu">
+      </div>
+      <div class="field">
+        <label for="auth-password">Password</label>
+        <input id="auth-password" type="password" autocomplete="current-password" required minlength="8" placeholder="8+ characters">
+      </div>
+      <button class="btn primary wide" id="auth-submit" type="submit">Sign in</button>
+      <p class="auth-error" id="auth-error"></p>
+    </form>
+    <p class="auth-toggle">
+      <span id="auth-toggle-text">New here?</span>
+      <a href="#" id="auth-toggle-link">Create an account</a>
+    </p>
+  </div>
+</div>
+
+<div id="app" class="app hidden">
   <aside class="sidebar">
     <div class="logo">
       <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><path fill="currentColor" d="M12 3 1 8l11 5 9-4.09V15h2V8L12 3zM5 13.18v3.64C5 18.6 8.13 20 12 20s7-1.4 7-3.18v-3.64l-7 3.18-7-3.18z"/></svg>
@@ -26,7 +57,7 @@
     </nav>
     <div class="sidebar-foot">
       <div id="ai-pill" class="ai-pill"></div>
-      <div class="whoami">🔒 Everything stays in this browser</div>
+      <div class="whoami" id="whoami"></div>
     </div>
   </aside>
   <main id="view" class="view"></main>
@@ -37,6 +68,7 @@
 </div>
 <div id="toasts" class="toasts"></div>
 
+<script src="./config.js"></script>
 <script src="./app.js"></script>
 </body>
 </html>

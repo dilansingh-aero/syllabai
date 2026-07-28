@@ -25,4 +25,4 @@ Reads PDF (pdf.js), Word (mammoth.js), and plain-text syllabi. Imports LMS `.ics
 calendar files, exports your deadline calendar as `.ics` for Google/Apple/Outlook,
 and can back up / restore all your data as a JSON file.
 
-*A full-stack edition (real accounts, server-side storage) lives in a separate repo.*
+See `SETUP.md` to connect this site to Supabase: real accounts, one hidden server API key with per-user daily limits, and permanent storage. Until configured, the site runs as a local in-browser demo.

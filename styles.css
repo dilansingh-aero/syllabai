@@ -226,3 +226,68 @@ label { font-size: 13px; font-weight: 600; color: var(--ink-soft); display: bloc
   .sidebar-foot { display: none; }
   .view { padding: 18px; }
 }
+
+/* ---------- ask layout: sessions sidebar + scope chips ---------- */
+.ask-layout { display: grid; grid-template-columns: 190px 1fr; gap: 18px; align-items: start; }
+.chat-side { position: sticky; top: 18px; display: flex; flex-direction: column; gap: 6px; }
+.chat-side-title { font-size: 11.5px; font-weight: 750; text-transform: uppercase; letter-spacing: .5px;
+  color: var(--ink-faint); margin: 8px 0 2px; }
+.chat-item { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  padding: 7px 10px; cursor: pointer; }
+.chat-item:hover { border-color: var(--accent); }
+.chat-item.active { border-color: var(--accent); background: var(--accent-soft); }
+.ci-title { font-size: 12.5px; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ci-date { font-size: 11px; color: var(--ink-faint); }
+.old-banner { background: var(--amber-soft); color: var(--amber); border-radius: 10px;
+  padding: 8px 12px; font-size: 13px; font-weight: 650; margin-bottom: 14px; }
+.scope-chips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+.scope-chip { font-size: 12.5px; font-weight: 700; border: 1.5px solid var(--line); background: var(--panel);
+  color: var(--ink-soft); border-radius: 99px; padding: 5px 13px; cursor: pointer; }
+.scope-chip:hover { border-color: var(--accent); color: var(--accent); }
+.scope-chip.sel { background: var(--accent); border-color: var(--accent); color: #fff; }
+.ask-box { border-width: 2px; }
+@media (max-width: 860px) { .ask-layout { grid-template-columns: 1fr; } .chat-side { position: static; flex-direction: row; flex-wrap: wrap; } }
+
+/* ---------- source viewer ---------- */
+.modal.wide { width: 820px; }
+.doc-view-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 10px; }
+.doc-view-body { position: relative; white-space: pre-wrap; font-size: 13.5px; line-height: 1.6; background: var(--bg);
+  border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px; max-height: 66vh; overflow: auto;
+  user-select: text; }
+mark.src-hl { background: #ffe25a; color: #1c2130; border-radius: 4px; padding: 1px 2px;
+  box-shadow: 0 0 0 3px #ffe25a; animation: hl-pulse 1.6s ease 2; }
+@keyframes hl-pulse { 50% { box-shadow: 0 0 0 8px rgba(255, 226, 90, .35); } }
+
+/* ---------- skips & absences ---------- */
+.allow-chip { font-size: 12px; font-weight: 750; background: var(--slate-soft); color: var(--ink-soft);
+  padding: 3px 9px; border-radius: 99px; cursor: pointer; border: 1px solid transparent; }
+.allow-chip:hover { border-color: var(--accent); color: var(--accent); }
+.allow-chip.zero { background: var(--red-soft); color: var(--red); }
+.allow-row { display: flex; align-items: center; gap: 8px; padding: 8px 2px; border-bottom: 1px dashed var(--line); }
+.allow-row:last-child { border-bottom: none; }
+.allow-row .spacer { flex: 1; }
+.allow-count { font-weight: 750; font-size: 13.5px; min-width: 70px; text-align: center; }
+.allow-count.zero { color: var(--red); }
+
+/* ---------- notes ---------- */
+.note-add { display: flex; gap: 10px; align-items: flex-start; margin-bottom: 12px; }
+.note-add textarea { flex: 1; min-height: 54px; }
+.note-row { display: flex; gap: 10px; align-items: flex-start; justify-content: space-between;
+  padding: 9px 2px; border-bottom: 1px dashed var(--line); font-size: 14px; white-space: pre-wrap; }
+.note-row:last-child { border-bottom: none; }
+
+/* ---------- dark theme ---------- */
+:root[data-theme="dark"] {
+  --bg: #131521; --panel: #1c1f2e; --ink: #e7e9f2; --ink-soft: #a9aec0; --ink-faint: #7c8296;
+  --line: #2b2f42; --accent: #818cf8; --accent-soft: #272b4a;
+  --green: #4ade80; --green-soft: #143224; --amber: #fbbf24; --amber-soft: #33270e;
+  --red: #f87171; --red-soft: #371b1f; --blue: #60a5fa; --blue-soft: #16263e;
+  --purple: #a78bfa; --purple-soft: #251d3d; --slate-soft: #262a3a;
+  --shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 6px 20px -8px rgba(0, 0, 0, .5);
+}
+:root[data-theme="dark"] input, :root[data-theme="dark"] select, :root[data-theme="dark"] textarea {
+  background: var(--bg); color: var(--ink); }
+:root[data-theme="dark"] .auth-wrap { background: radial-gradient(1200px 600px at 20% -10%, #23264a 0%, var(--bg) 55%); }
+:root[data-theme="dark"] .toast { background: #343b55; }
+:root[data-theme="dark"] mark.src-hl { background: #eab308; box-shadow: 0 0 0 3px #eab308; }
+:root[data-theme="dark"] .color-dot.sel { border-color: #fff; }
