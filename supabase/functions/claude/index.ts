@@ -83,11 +83,15 @@ Rules:
 - grading: one entry per graded component with its weight as written (e.g. "30%"). If no weights are given, leave the weight "".
 - other_key_policies: up to 6 short standout policies a student would want surfaced (e.g. "No extra credit", "3 slip days total").
 - events: every dated deliverable or exam a student would put on a calendar. date must be ISO YYYY-MM-DD. Today is {today}; the course term is "{term}". If a date has no year, infer it from the term so it lands in the plausible academic window. Skip anything whose date you cannot resolve to a specific day. time is "HH:MM" 24 hour if stated, else "".
-- Do not create events for ranges like "Week 3" or "TBA".`;
+- Do not create events for ranges like "Week 3" or "TBA".
+- allowances: every countable per-semester allowance the syllabus explicitly grants, with the EXACT number stated: dropped lowest scores (e.g. "lowest homework dropped" is total 1, "two lowest quiz scores dropped" is total 2), permitted absences or lecture misses, slip/grace/late days, free quiz misses. label is short and student-facing ("Homework drops", "Class skips", "Slip days", "Quiz drops", "Absences"). Only include allowances with an explicit number; never infer one. [] if none.`;
 
 const FACTS_SCHEMA = {
-  type: "object", additionalProperties: false, required: ["facts", "events"],
+  type: "object", additionalProperties: false, required: ["facts", "events", "allowances"],
   properties: {
+    allowances: { type: "array", items: { type: "object", additionalProperties: false,
+      required: ["label", "total"],
+      properties: { label: { type: "string" }, total: { type: "integer" } } } },
     facts: {
       type: "object", additionalProperties: false,
       required: ["instructor", "instructor_email", "office_hours", "location_or_modality", "grading",

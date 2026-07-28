@@ -3,6 +3,9 @@
 
 create extension if not exists pgcrypto;
 
+-- Upgrade for databases created before descriptions existed (safe to re-run).
+alter table if exists public.courses add column if not exists description text not null default '';
+
 -- ---------------------------------------------------------------- courses
 create table if not exists public.courses (
   id uuid primary key default gen_random_uuid(),
@@ -12,6 +15,7 @@ create table if not exists public.courses (
   term text not null default '',
   instructor text not null default '',
   color text not null default '#4f46e5',
+  description text not null default '',
   allowances jsonb not null default '[]',
   created_at timestamptz not null default now()
 );

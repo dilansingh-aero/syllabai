@@ -15,7 +15,18 @@ const CFG = window.MYSYLLABI_CONFIG || {};
 const REMOTE = Boolean(CFG.supabaseUrl && CFG.supabaseAnonKey && window.supabase);
 const supa = REMOTE ? window.supabase.createClient(CFG.supabaseUrl, CFG.supabaseAnonKey) : null;
 
-const COURSE_COLORS = ["#4f46e5", "#0d9488", "#d97706", "#db2777", "#7c3aed", "#059669", "#dc2626", "#2563eb"];
+const COLOR_OPTIONS = [
+  { name: "Lava Red", hex: "#dc2626" },
+  { name: "Sunset Ember", hex: "#ea580c" },
+  { name: "Golden Amber", hex: "#d97706" },
+  { name: "Forest Green", hex: "#059669" },
+  { name: "Ocean Teal", hex: "#0d9488" },
+  { name: "Sky Blue", hex: "#2563eb" },
+  { name: "Royal Indigo", hex: "#4f46e5" },
+  { name: "Grape Violet", hex: "#7c3aed" },
+  { name: "Rose Pink", hex: "#db2777" },
+];
+const COURSE_COLORS = COLOR_OPTIONS.map((o) => o.hex);
 const KIND_ICONS = { exam: "📝", quiz: "❓", assignment: "📌", project: "📦", class: "🏫", other: "📅" };
 const ALLOW_EMOJI = { "Class skips": "🏫", "Homework skips": "📌", "Lab skips": "🧪" };
 const SESSION_GAP_MS = 30 * 60 * 1000;
@@ -304,6 +315,54 @@ function extractFactsHeuristic(text) {
   return f;
 }
 
+/* ---- allowance (skips/drops) detection ---- */
+
+const WORDNUM = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8 };
+function toNum(s) { return WORDNUM[String(s).toLowerCase()] || parseInt(s, 10) || 0; }
+
+function labelEmoji(label) {
+  const l = label.toLowerCase();
+  if (/class|lecture|absence|attend/.test(l)) return "🏫";
+  if (/homework|hw|assignment|pset|problem/.test(l)) return "📌";
+  if (/lab/.test(l)) return "🧪";
+  if (/quiz/.test(l)) return "❓";
+  return "🎟";
+}
+
+function cap(s) { return s ? s[0].toUpperCase() + s.slice(1) : s; }
+
+function extractAllowancesHeuristic(text) {
+  const found = [];
+  const add = (label, total) => { if (total >= 1 && total <= 30) found.push({ label, total }); };
+  let m;
+  if ((m = text.match(/(\d+|one|two|three|four|five|six)\s+(?:free\s+)?slip days?/i))) add("Slip days", toNum(m[1]));
+  if ((m = text.match(/(\d+|one|two|three|four|five|six)\s+(?:grace|late) days?/i))) add("Late days", toNum(m[1]));
+  if ((m = text.match(/miss (?:up to )?(\d+|one|two|three|four|five|six)\s+(?:lectures?|classes)/i))) add("Class skips", toNum(m[1]));
+  if ((m = text.match(/(\d+|one|two|three|four|five|six)\s+unexcused absences/i))) add("Absences", toNum(m[1]));
+  const dropRe = /(?:(\d+|two|three|four)\s+)?lowest\s+(homework|hw|quiz|problem set|pset|lab)?\s*(?:scores?|grades?)?\s*(?:is|are|will be)?\s*dropped/gi;
+  while ((m = dropRe.exec(text))) {
+    const total = m[1] ? toNum(m[1]) : 1;
+    const subject = m[2] ? cap(m[2].replace(/^hw$/i, "Homework").replace(/^pset$/i, "Problem set")) : "";
+    add(subject ? `${subject} drops` : "Dropped scores", total);
+  }
+  return found;
+}
+
+function mergeAllowances(course, found) {
+  course.allowances = course.allowances || [];
+  const existing = new Set(course.allowances.map((a) => a.label.toLowerCase().trim()));
+  let added = 0;
+  for (const f of found.slice(0, 8)) {
+    const label = String(f.label || "").slice(0, 30).trim();
+    const total = Math.max(1, Math.min(99, parseInt(f.total, 10) || 0));
+    if (!label || !f.total || existing.has(label.toLowerCase())) continue;
+    existing.add(label.toLowerCase());
+    course.allowances.push({ label, emoji: labelEmoji(label), total, remaining: total });
+    added++;
+  }
+  return added;
+}
+
 const ROUTE_RULES = [
   ["professor", /\b(extension|extenuating|sick|illness|ill\b|medical|emergency|family|funeral|accommodat|disability|conflict with (the )?(exam|midterm|final)|miss(ed|ing)? (the )?(exam|midterm|final)|grade dispute|final grade|incomplete|excused)\b/i],
   ["ta", /\b(homework|hw\b|assignment|problem set|pset|lab\b|regrade|rubric|partial credit|how (do|to) (i )?submit|autograder|office hours)\b/i],
@@ -526,7 +585,7 @@ const repo = {
   async loadAll() {
     if (REMOTE) {
       const [courses, docs, events, notes, sessions] = await Promise.all([
-        sbThrow(supa.from("courses").select("id, code, title, term, instructor, color, allowances").order("created_at")),
+        sbThrow(supa.from("courses").select("*").order("created_at")),
         sbThrow(supa.from("documents").select("id, course_id, filename, kind, facts, facts_mode, chunks, file_path, uploaded_at").order("uploaded_at")),
         sbThrow(supa.from("events").select("*").order("date")),
         sbThrow(supa.from("notes").select("id, course_id, text, created_at").order("created_at", { ascending: false })),
@@ -541,12 +600,37 @@ const repo = {
     }
   },
 
+  // Older databases may lack the description column; retry without it once.
+  async _courseWrite(op, payload) {
+    try {
+      return await op(payload);
+    } catch (e) {
+      if (/description/.test(String(e.message)) && "description" in payload) {
+        const { description, ...rest } = payload;
+        return await op(rest);
+      }
+      throw e;
+    }
+  },
+
   async addCourse(fields) {
-    const course = { id: uuid(), allowances: [], ...fields };
-    if (REMOTE) await sbThrow(supa.from("courses").insert({ ...course, user_id: state.user.id }));
+    const course = { id: uuid(), allowances: [], description: "", ...fields };
+    if (REMOTE) {
+      await this._courseWrite((p) => sbThrow(supa.from("courses").insert(p)),
+        { ...course, user_id: state.user.id });
+    }
     state.db.courses.push(course);
     if (!REMOTE) localSave();
     return course;
+  },
+
+  async updateCourse(course, fields) {
+    Object.assign(course, fields);
+    if (REMOTE) {
+      await this._courseWrite((p) => sbThrow(supa.from("courses").update(p).eq("id", course.id)), fields);
+    } else {
+      localSave();
+    }
   },
 
   async delCourse(id) {
@@ -904,6 +988,7 @@ async function ingestDocument(course, filename, text, kind, quiet, file) {
     chunks: chunkText(text), facts: null, facts_mode: "heuristic", file_path: "",
     uploaded_at: new Date().toISOString() };
   let events = [];
+  let allowancesFound = null;
   if (REMOTE && state.usage.on && !quiet) {
     try {
       const res = await repo.invokeClaude({ kind: "extract", text, code: course.code, term: course.term || "" });
@@ -912,6 +997,9 @@ async function ingestDocument(course, filename, text, kind, quiet, file) {
         doc.facts_mode = "ai";
         events = (res.result.events || []).filter((e) => /^\d{4}-\d{2}-\d{2}$/.test(e.date))
           .map((e) => ({ ...e, time: /^\d{2}:\d{2}$/.test(e.time) ? e.time : "" }));
+        if (Array.isArray(res.result.allowances) && res.result.allowances.length) {
+          allowancesFound = res.result.allowances;
+        }
       }
     } catch (_e) { /* heuristics below */ }
   }
@@ -919,9 +1007,12 @@ async function ingestDocument(course, filename, text, kind, quiet, file) {
     doc.facts = extractFactsHeuristic(text);
     events = extractEventsHeuristic(text);
   }
+  if (!allowancesFound) allowancesFound = extractAllowancesHeuristic(text);
   await repo.addDocument(doc, file);
   const eventsAdded = await repo.addEventsBulk(course.id, doc.id, events, "auto");
-  return { doc, eventsAdded };
+  const allowancesAdded = mergeAllowances(course, allowancesFound);
+  if (allowancesAdded) await repo.saveAllowances(course);
+  return { doc, eventsAdded, allowancesAdded };
 }
 
 async function loadDemo() {
@@ -1072,11 +1163,25 @@ window.navigate = navigate;
 
 /* ---------- dashboard ---------- */
 
-function allowanceChips(c) {
-  return (c.allowances || []).map((a, i) => `
-    <span class="allow-chip ${a.remaining === 0 ? "zero" : ""}" data-course="${c.id}" data-idx="${i}"
-      title="${esc(a.label)}: ${a.remaining} of ${a.total} left. Click to use one.">
-      ${esc(a.emoji || "🎟")} ${a.remaining}/${a.total}</span>`).join("");
+/* Green when plenty remain, sliding to red as they run out. */
+function allowColor(remaining, total) {
+  const ratio = total > 0 ? Math.max(0, Math.min(1, remaining / total)) : 0;
+  return `hsl(${Math.round(120 * ratio)}, 68%, 38%)`;
+}
+
+function colorSelectHtml(id, selectedHex) {
+  const sel = COLOR_OPTIONS.some((o) => o.hex === selectedHex) ? selectedHex : COLOR_OPTIONS[0].hex;
+  return `<div class="color-pick">
+    <span class="color-swatch" id="${id}-swatch" style="background:${sel}"></span>
+    <select id="${id}">${COLOR_OPTIONS.map((o) =>
+      `<option value="${o.hex}" ${o.hex === sel ? "selected" : ""}>${o.name}</option>`).join("")}</select>
+  </div>`;
+}
+
+function bindColorSelect(id) {
+  const el = $("#" + id);
+  el.addEventListener("change", () => { $("#" + id + "-swatch").style.background = el.value; });
+  return () => el.value;
 }
 
 function renderDashboard() {
@@ -1109,6 +1214,7 @@ function renderDashboard() {
         <div class="card course-card" data-id="${c.id}">
           <div class="stripe" style="background:${esc(c.color)}"></div>
           <h3>${esc(c.code)}</h3><div class="ctitle">${esc(c.title || "")}</div>
+          ${c.description ? `<div class="cdesc">${esc(c.description)}</div>` : ""}
         </div>`).join("")}
     </div>
     ${state.db.courses.length === 0 ? `<div class="empty"><div class="big-ic">🎓</div>No courses yet.</div>` : ""}`;
@@ -1125,31 +1231,29 @@ function renderDashboard() {
 }
 
 function openAddCourse() {
-  const dots = COURSE_COLORS.map((c, i) =>
-    `<span class="color-dot ${i === 0 ? "sel" : ""}" data-color="${c}" style="background:${c}"></span>`).join("");
+  const startColor = COURSE_COLORS[state.db.courses.length % COURSE_COLORS.length];
   openModal(`
     <h3>Add a course</h3>
     <div class="field"><label>Course code *</label><input id="nc-code" placeholder="CS 2110"></div>
     <div class="field"><label>Title</label><input id="nc-title" placeholder="Data Structures"></div>
+    <div class="field"><label>Description</label><textarea id="nc-desc" rows="2" placeholder="Anything worth remembering about this class"></textarea></div>
     <div class="row">
       <div class="field"><label>Term</label><input id="nc-term" placeholder="Fall 2026"></div>
       <div class="field"><label>Instructor</label><input id="nc-inst" placeholder="Prof. Smith"></div>
     </div>
-    <div class="field"><label>Color</label><div class="color-dots">${dots}</div></div>
+    <div class="field"><label>Color</label>${colorSelectHtml("nc-color", startColor)}</div>
     <div class="modal-actions"><button class="btn" id="nc-cancel">Cancel</button>
     <button class="btn primary" id="nc-save">Add course</button></div>`);
-  let color = COURSE_COLORS[state.db.courses.length % COURSE_COLORS.length];
-  $$(".color-dot").forEach((dot) => dot.addEventListener("click", () => {
-    $$(".color-dot").forEach((d) => d.classList.remove("sel"));
-    dot.classList.add("sel"); color = dot.dataset.color;
-  }));
+  const getColor = bindColorSelect("nc-color");
   $("#nc-cancel").addEventListener("click", closeModal);
   $("#nc-save").addEventListener("click", async () => {
     const code = $("#nc-code").value.trim().slice(0, 40);
     if (!code) return toast("Course code is required (e.g. CS 2110).", "err");
     try {
       const course = await repo.addCourse({ code, title: $("#nc-title").value.trim().slice(0, 120),
-        term: $("#nc-term").value.trim().slice(0, 40), instructor: $("#nc-inst").value.trim().slice(0, 80), color });
+        description: $("#nc-desc").value.trim().slice(0, 300),
+        term: $("#nc-term").value.trim().slice(0, 40), instructor: $("#nc-inst").value.trim().slice(0, 80),
+        color: getColor() });
       closeModal(); toast("Course added. Now drop in its syllabus.");
       navigate("course", course.id);
     } catch (err) { toast(err.message, "err"); }
@@ -1382,9 +1486,11 @@ function renderCourse(courseId) {
     <div class="view-head">
       <div><a onclick="navigate('dashboard')">← Courses</a>
         <h1 style="color:${esc(c.color)}">${esc(c.code)}</h1>
-        <div class="sub">${esc(c.title || "")}${c.term ? " · " + esc(c.term) : ""}${c.instructor ? " · " + esc(c.instructor) : ""}</div></div>
+        <div class="sub">${esc(c.title || "")}${c.term ? " · " + esc(c.term) : ""}${c.instructor ? " · " + esc(c.instructor) : ""}</div>
+        ${c.description ? `<div class="sub" style="max-width:560px">${esc(c.description)}</div>` : ""}</div>
       <div style="display:flex;gap:8px">
         <button class="btn" id="ask-this">💬 Ask about this course</button>
+        <button class="btn" id="edit-course">✏️ Edit</button>
         <button class="btn danger" id="del-course">Delete</button></div>
     </div>
 
@@ -1398,13 +1504,17 @@ function renderCourse(courseId) {
       <div class="card skips-card">
         <div style="display:flex;justify-content:space-between;align-items:center;gap:6px">
           <h3 style="font-size:14px">Skips</h3>
-          <button class="btn small" id="add-allow" title="Add a tracker">＋</button>
+          <span>
+            <button class="btn small" id="auto-allow" title="Scan this course's syllabus and notes for allowed skips, drops, and slip days">✨</button>
+            <button class="btn small" id="add-allow" title="Add a tracker manually">＋</button>
+          </span>
         </div>
         ${(c.allowances || []).length ? c.allowances.map((a, i) => `
           <div class="allow-row">
-            <span title="${esc(a.label)}">${esc(a.emoji || "🎟")}</span>
+            <span class="allow-ic">${esc(a.emoji || "🎟")}</span>
+            <span class="allow-name" title="${esc(a.label)}">${esc(a.label)}</span>
             <button class="btn small" data-allow-use="${i}" title="Use one">−</button>
-            <span class="allow-count ${a.remaining === 0 ? "zero" : ""}">${a.remaining}/${a.total}</span>
+            <span class="allow-count" style="background:${allowColor(a.remaining, a.total)}">${a.remaining}/${a.total}</span>
             <button class="btn small" data-allow-undo="${i}" title="Give one back">+</button>
             <button class="btn small danger" data-allow-del="${i}" title="Remove tracker">✕</button>
           </div>`).join("") : `<p class="muted" style="font-size:12px">Track class, homework, or lab skips. 3/3 counts down as you use them.</p>`}
@@ -1460,8 +1570,19 @@ function renderCourse(courseId) {
     toast("Course deleted."); navigate("dashboard");
   });
 
+  $("#edit-course").addEventListener("click", () => openEditCourse(c));
   const saveAllow = async () => { await repo.saveAllowances(c); renderCourse(courseId); };
   $("#add-allow").addEventListener("click", () => openAddAllowance(c, saveAllow));
+  $("#auto-allow").addEventListener("click", async () => {
+    const btn = $("#auto-allow");
+    btn.disabled = true;
+    try {
+      const added = await autoDetectSkips(c);
+      toast(added ? `Found ${added} tracker${added === 1 ? "" : "s"} in your materials.`
+        : "No countable skips, drops, or slip days found in this course's materials.");
+    } catch (err) { toast(err.message, "err"); }
+    renderCourse(courseId);
+  });
   $$("[data-allow-use]").forEach((b) => b.addEventListener("click", () => {
     const a = c.allowances[Number(b.dataset.allowUse)];
     if (a && a.remaining > 0) { a.remaining--; saveAllow(); }
@@ -1505,6 +1626,52 @@ function renderCourse(courseId) {
   dz.addEventListener("drop", (e) => { const f = e.dataTransfer.files && e.dataTransfer.files[0]; if (f) uploadFile(courseId, f); });
 }
 
+async function autoDetectSkips(course) {
+  // Scan every document's full text plus the course notes.
+  const found = [];
+  for (const doc of docsOf(course.id)) {
+    try {
+      const src = await repo.getSource(doc.id);
+      if (src) found.push(...extractAllowancesHeuristic(src.text));
+    } catch (_e) { /* skip unreadable doc */ }
+  }
+  for (const note of notesOf(course.id)) found.push(...extractAllowancesHeuristic(note.text));
+  const added = mergeAllowances(course, found);
+  if (added) await repo.saveAllowances(course);
+  return added;
+}
+
+function openEditCourse(course) {
+  openModal(`
+    <h3>Edit course</h3>
+    <div class="field"><label>Course code *</label><input id="ec-code" value="${esc(course.code)}"></div>
+    <div class="field"><label>Title</label><input id="ec-title" value="${esc(course.title || "")}"></div>
+    <div class="field"><label>Description</label><textarea id="ec-desc" rows="2" placeholder="Anything worth remembering about this class">${esc(course.description || "")}</textarea></div>
+    <div class="row">
+      <div class="field"><label>Term</label><input id="ec-term" value="${esc(course.term || "")}"></div>
+      <div class="field"><label>Instructor</label><input id="ec-inst" value="${esc(course.instructor || "")}"></div>
+    </div>
+    <div class="field"><label>Color</label>${colorSelectHtml("ec-color", course.color)}</div>
+    <div class="modal-actions"><button class="btn" id="ec-cancel">Cancel</button>
+    <button class="btn primary" id="ec-save">Save</button></div>`);
+  const getColor = bindColorSelect("ec-color");
+  $("#ec-cancel").addEventListener("click", closeModal);
+  $("#ec-save").addEventListener("click", async () => {
+    const code = $("#ec-code").value.trim().slice(0, 40);
+    if (!code) return toast("Course code is required.", "err");
+    try {
+      await repo.updateCourse(course, {
+        code, title: $("#ec-title").value.trim().slice(0, 120),
+        description: $("#ec-desc").value.trim().slice(0, 300),
+        term: $("#ec-term").value.trim().slice(0, 40),
+        instructor: $("#ec-inst").value.trim().slice(0, 80), color: getColor(),
+      });
+      closeModal(); toast("Course updated.");
+      renderCourse(course.id);
+    } catch (err) { toast(err.message, "err"); }
+  });
+}
+
 function openAddAllowance(course, onSave) {
   openModal(`
     <h3>Add a tracker</h3>
@@ -1535,8 +1702,9 @@ async function uploadFile(courseId, file) {
   if (dz) dz.innerHTML = `<b>Reading ${esc(file.name)}…</b> extracting policies & deadlines`;
   try {
     const { text, kind } = await extractFile(file);
-    const { doc, eventsAdded } = await ingestDocument(courseById(courseId), file.name, text, kind, false, file);
-    toast(`Indexed ${doc.chunks.length} sections, added ${eventsAdded} calendar events.`);
+    const { doc, eventsAdded, allowancesAdded } = await ingestDocument(courseById(courseId), file.name, text, kind, false, file);
+    toast(`Indexed ${doc.chunks.length} sections, added ${eventsAdded} calendar events`
+      + (allowancesAdded ? `, set up ${allowancesAdded} skip tracker${allowancesAdded === 1 ? "" : "s"}.` : "."));
   } catch (err) { toast(err.message, "err"); }
   renderCourse(courseId);
 }
