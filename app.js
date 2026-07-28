@@ -34,8 +34,8 @@ const SESSION_GAP_MS = 30 * 60 * 1000;
 const state = {
   user: null,                    // {id, email, name}
   usage: { on: false, limit: 0, used: 0, left: 0 },
-  db: { courses: [], docs: [], events: [], notes: [], sessions: [] },
-  askCourse: "", calMonth: null, selectedDay: null,
+  db: { courses: [], docs: [], events: [], notes: [], sessions: [], feeds: [] },
+  askCourse: "", gradeCourse: "", calMonth: null, selectedDay: null,
   viewingSessionId: null, currentSessionId: null, msgs: [],
 };
 
@@ -346,7 +346,7 @@ function extractAllowancesHeuristic(text) {
   const add = (label, total) => { if (total >= 1 && total <= 30) found.push({ label, total }); };
   let m;
   if ((m = text.match(new RegExp(`(${NUMPAT})\\s+(?:free\\s+)?slip days?`, "i")))) add("Slip days", toNum(m[1]));
-  if ((m = text.match(new RegExp(`(${NUMPAT})\\s+(?:grace|late) days?`, "i")))) add("Late days", toNum(m[1]));
+  if ((m = text.match(new RegExp(`(${NUMPAT})\\s+(?:free\\s+)?(?:grace|late) days?`, "i")))) add("Late days", toNum(m[1]));
   if ((m = text.match(new RegExp(`miss (?:up to )?(${NUMPAT})\\s+(?:lectures?|classes)`, "i")))) add("Class skips", toNum(m[1]));
   if ((m = text.match(new RegExp(`(${NUMPAT})\\s+(?:unexcused |excused )?absences?(?:\\s+(?:are\\s+)?(?:allowed|permitted))?`, "i")))
     && /unexcused|excused|allowed|permitted/.test(m[0])) add("Absences", toNum(m[1]));
@@ -613,18 +613,19 @@ async function sbThrow(promise) {
 const repo = {
   async loadAll() {
     if (REMOTE) {
-      const [courses, docs, events, notes, sessions] = await Promise.all([
+      const [courses, docs, events, notes, sessions, feeds] = await Promise.all([
         sbThrow(supa.from("courses").select("*").order("created_at")),
         sbThrow(supa.from("documents").select("id, course_id, filename, kind, facts, facts_mode, chunks, file_path, uploaded_at").order("uploaded_at")),
         sbThrow(supa.from("events").select("*").order("date")),
         sbThrow(supa.from("notes").select("id, course_id, text, created_at").order("created_at", { ascending: false })),
         sbThrow(supa.from("chat_sessions").select("*").order("last_at", { ascending: false })),
+        supa.from("feeds").select("*").then(({ data }) => data || []),
       ]);
-      state.db = { courses, docs, events, notes, sessions };
+      state.db = { courses, docs, events, notes, sessions, feeds };
     } else {
       state.db = {
         courses: localDb.courses, docs: localDb.docs, events: localDb.events,
-        notes: localDb.notes, sessions: localDb.sessions,
+        notes: localDb.notes, sessions: localDb.sessions, feeds: [],
       };
     }
   },
@@ -632,7 +633,7 @@ const repo = {
   // Older databases may lack newer columns; retry without whichever one the
   // error names until the write goes through.
   async _courseWrite(op, payload) {
-    const optional = ["description", "facts_override"];
+    const optional = ["description", "facts_override", "grades"];
     for (let attempt = 0; attempt <= optional.length; attempt++) {
       try {
         return await op(payload);
@@ -647,7 +648,7 @@ const repo = {
   },
 
   async addCourse(fields) {
-    const course = { id: uuid(), allowances: [], description: "", facts_override: {}, ...fields };
+    const course = { id: uuid(), allowances: [], description: "", facts_override: {}, grades: {}, ...fields };
     if (REMOTE) {
       await this._courseWrite((p) => sbThrow(supa.from("courses").insert(p)),
         { ...course, user_id: state.user.id });
@@ -840,6 +841,88 @@ const repo = {
     }
     state.db.sessions = [];
     state.currentSessionId = null; state.viewingSessionId = null; state.msgs = [];
+  },
+
+  /* ---- shared courses (remote only) ---- */
+
+  async shareCourse(course) {
+    const docs = [];
+    for (const d of docsOf(course.id)) {
+      try {
+        const src = await this.getSource(d.id);
+        if (src) docs.push({ filename: d.filename, kind: d.kind, text: src.text,
+          chunks: d.chunks || [], facts: d.facts || null });
+      } catch (_e) { /* skip */ }
+    }
+    const events = state.db.events.filter((e) => e.course_id === course.id)
+      .map((e) => ({ title: e.title, date: e.date, time: e.time, kind: e.kind, details: e.details || "" }));
+    const snapshot = {
+      owner_id: state.user.id, code: course.code, title: course.title || "",
+      term: course.term || "", instructor: course.instructor || "", color: course.color,
+      description: course.description || "",
+      allowances: (course.allowances || []).map((a) => ({ ...a, remaining: a.total })),
+      docs, events,
+    };
+    const existing = await sbThrow(supa.from("shared_courses").select("id")
+      .eq("owner_id", state.user.id).eq("code", course.code).maybeSingle());
+    if (existing) {
+      await sbThrow(supa.from("shared_courses").update(snapshot).eq("id", existing.id));
+      return existing.id;
+    }
+    const row = await sbThrow(supa.from("shared_courses").insert(snapshot).select("id").single());
+    return row.id;
+  },
+
+  async searchShared(q) {
+    const safe = q.replace(/[%,()]/g, " ").trim();
+    if (safe.length < 2) return [];
+    return await sbThrow(supa.from("shared_courses")
+      .select("id, code, title, term, instructor, color, created_at")
+      .or(`code.ilike.%${safe}%,title.ilike.%${safe}%,instructor.ilike.%${safe}%`)
+      .order("created_at", { ascending: false }).limit(8));
+  },
+
+  async getShared(id) {
+    return await sbThrow(supa.from("shared_courses").select("*").eq("id", id).single());
+  },
+
+  async importShared(shared) {
+    const course = await this.addCourse({ code: shared.code, title: shared.title,
+      term: shared.term, instructor: shared.instructor, color: shared.color,
+      description: shared.description || "",
+      allowances: (shared.allowances || []).map((a) => ({ ...a, remaining: a.total })) });
+    for (const d of shared.docs || []) {
+      await this.addDocument({ id: uuid(), course_id: course.id, filename: d.filename,
+        kind: d.kind, text: d.text, chunks: d.chunks || [], facts: d.facts || null,
+        facts_mode: d.facts ? "ai" : "heuristic", file_path: "",
+        uploaded_at: new Date().toISOString() }, null);
+    }
+    if ((shared.events || []).length) await this.addEventsBulk(course.id, null, shared.events, "shared");
+    return course;
+  },
+
+  /* ---- calendar feeds (remote only) ---- */
+
+  async addFeed(url) {
+    const row = { id: uuid(), url, added_at: new Date().toISOString() };
+    await sbThrow(supa.from("feeds").insert({ ...row, user_id: state.user.id }));
+    state.db.feeds.push(row);
+    return row;
+  },
+
+  async delFeed(id) {
+    await sbThrow(supa.from("feeds").delete().eq("id", id));
+    state.db.feeds = state.db.feeds.filter((f) => f.id !== id);
+  },
+
+  async getDigestPref() {
+    const { data } = await supa.from("digest_prefs").select("enabled")
+      .eq("user_id", state.user.id).maybeSingle();
+    return data ? data.enabled : true;
+  },
+
+  async setDigestPref(enabled) {
+    await sbThrow(supa.from("digest_prefs").upsert({ user_id: state.user.id, enabled }));
   },
 
   // Calls the edge function. Returns null in local mode (caller falls back to heuristics).
@@ -1189,6 +1272,7 @@ function navigate(view, param) {
   if (view === "dashboard") renderDashboard();
   else if (view === "course") renderCourse(param);
   else if (view === "ask") renderAsk();
+  else if (view === "grades") renderGrades();
   else if (view === "calendar") renderCalendar();
   else if (view === "settings") renderSettings();
 }
@@ -1263,8 +1347,140 @@ function renderDashboard() {
   });
 }
 
+// Best guess at course code / title / term / instructor from the first lines
+// of a syllabus, so a dropped file can become a fully-named course.
+function guessCourseMeta(text, filename) {
+  const head = text.split(/\r?\n/).slice(0, 40).map((l) => l.trim()).filter(Boolean);
+  const meta = { code: "", title: "", term: "", instructor: "" };
+  const codeRe = /\b([A-Z]{2,5})\s?-?\s?(\d{3,4}[A-Z]?)\b/;
+  const notCodes = new Set(["FALL", "SPRING", "SUMMER", "WINTER", "ROOM", "HALL", "SUITE", "PHONE"]);
+  for (const line of head) {
+    const m = line.match(codeRe);
+    if (!m || notCodes.has(m[1])) continue;
+    meta.code = `${m[1]} ${m[2]}`;
+    const after = line.slice(line.indexOf(m[0]) + m[0].length).replace(/^[\s:.·–—-]+/, "").trim();
+    if (after.length >= 4 && after.length <= 90 && !/university|college|department|semester/i.test(after)) {
+      meta.title = after;
+    }
+    break;
+  }
+  if (!meta.code && filename) {
+    const m = filename.toUpperCase().match(codeRe);
+    if (m && !notCodes.has(m[1])) meta.code = `${m[1]} ${m[2]}`;
+  }
+  const termM = text.match(/\b(fall|spring|summer|winter)\s*'?(\d{2}|\d{4})\b/i);
+  if (termM) meta.term = `${cap(termM[1].toLowerCase())} ${termM[2].length === 2 ? "20" + termM[2] : termM[2]}`;
+  for (const l of head) {
+    const im = l.match(/^(?:instructor|professor|taught by)\s*:?\s*(.{3,})$/i);
+    if (im) { meta.instructor = im[1].replace(EMAIL_RE, "").replace(/[()]/g, "").trim().slice(0, 80); break; }
+  }
+  return meta;
+}
+
 function openAddCourse() {
   const startColor = COURSE_COLORS[state.db.courses.length % COURSE_COLORS.length];
+  openModal(`
+    <h3>Add a course</h3>
+    <p style="margin:4px 0 10px"><b>Fastest:</b> drop the syllabus. Code, title, course info, deadlines, and skip trackers all fill in automatically.</p>
+    <div class="field"><label>Color</label>${colorSelectHtml("ac-color", startColor)}</div>
+    <div class="dropzone" id="ac-drop">
+      <b>Drop the syllabus here</b> or <a id="ac-browse">browse</a> — PDF, Word, or text
+      <input type="file" id="ac-file" accept=".pdf,.docx,.txt,.md" style="display:none">
+    </div>
+    ${REMOTE ? `
+    <div class="add-divider">or grab a course a classmate shared</div>
+    <div class="field" style="position:relative">
+      <input id="ac-search" placeholder="Search by code, title, or professor…" autocomplete="off">
+      <div class="type-results" id="ac-results"></div>
+    </div>` : ""}
+    <div class="add-divider">or</div>
+    <p style="text-align:center;margin:2px 0"><a id="ac-manual">✏️ Enter the details manually</a></p>
+    <div class="modal-actions"><button class="btn" id="ac-cancel">Cancel</button></div>`);
+  const getColor = bindColorSelect("ac-color");
+  $("#ac-cancel").addEventListener("click", closeModal);
+  $("#ac-manual").addEventListener("click", () => openAddCourseManual(getColor()));
+  const fi = $("#ac-file"), dz = $("#ac-drop");
+  $("#ac-browse").addEventListener("click", () => fi.click());
+  const start = (file) => { if (file) addCourseFromFile(file, getColor()); };
+  fi.addEventListener("change", () => start(fi.files[0]));
+  ["dragover", "dragenter"].forEach((n) => dz.addEventListener(n, (e) => { e.preventDefault(); dz.classList.add("drag"); }));
+  ["dragleave", "drop"].forEach((n) => dz.addEventListener(n, (e) => { e.preventDefault(); dz.classList.remove("drag"); }));
+  dz.addEventListener("drop", (e) => start(e.dataTransfer.files && e.dataTransfer.files[0]));
+  if (REMOTE) bindSharedSearch();
+}
+
+async function addCourseFromFile(file, color) {
+  openModal(`<h3>Reading ${esc(file.name)}…</h3><p class="muted">Pulling out the course, its info, deadlines, and skips.</p>`);
+  try {
+    const { text, kind } = await extractFile(file);
+    const meta = guessCourseMeta(text, file.name);
+    const course = await repo.addCourse({
+      code: meta.code || file.name.replace(/\.[^.]+$/, "").slice(0, 40) || "New course",
+      title: meta.title, term: meta.term, instructor: meta.instructor, color });
+    const { eventsAdded, allowancesAdded } = await ingestDocument(course, file.name, text, kind, false, file);
+    closeModal();
+    toast(`${course.code} is set up: course info filled, ${eventsAdded} deadline${eventsAdded === 1 ? "" : "s"}`
+      + (allowancesAdded ? ` and ${allowancesAdded} skip tracker${allowancesAdded === 1 ? "" : "s"}` : "") + " added.");
+    navigate("course", course.id);
+  } catch (err) { closeModal(); toast(err.message, "err"); openAddCourse(); }
+}
+
+function bindSharedSearch() {
+  const input = $("#ac-search"), results = $("#ac-results");
+  let timer = null;
+  input.addEventListener("input", () => {
+    clearTimeout(timer);
+    const q = input.value.trim();
+    if (q.length < 2) { results.innerHTML = ""; return; }
+    timer = setTimeout(async () => {
+      try {
+        const rows = await repo.searchShared(q);
+        results.innerHTML = rows.length ? rows.map((r) => `
+          <div class="type-row" data-shared="${r.id}">
+            <span class="kind-dot" style="background:${esc(r.color)}"></span>
+            <span class="tr-main"><b>${esc(r.code)}</b> ${esc(r.title || "")}</span>
+            <span class="tr-sub">${esc([r.instructor, r.term].filter(Boolean).join(" · "))}</span>
+            <span class="btn small primary">Add</span>
+          </div>`).join("")
+        : `<div class="type-row muted" style="cursor:default">Nothing shared under that yet. Add it yourself, then hit Share so classmates get it free.</div>`;
+        $$(".type-row[data-shared]", results).forEach((row) =>
+          row.addEventListener("click", () => importSharedById(row.dataset.shared)));
+      } catch (e) { results.innerHTML = `<div class="type-row muted" style="cursor:default">${esc(e.message)}</div>`; }
+    }, 250);
+  });
+}
+
+async function importSharedById(id) {
+  openModal(`<h3>Importing…</h3><p class="muted">Copying the course into your account.</p>`);
+  try {
+    const shared = await repo.getShared(id);
+    const course = await repo.importShared(shared);
+    closeModal();
+    const nd = (shared.docs || []).length, ne = (shared.events || []).length;
+    toast(`${course.code} imported: ${nd} document${nd === 1 ? "" : "s"}, ${ne} deadline${ne === 1 ? "" : "s"}.`);
+    navigate("course", course.id);
+  } catch (err) { closeModal(); toast(err.message, "err"); }
+}
+
+async function handleShareHash() {
+  const m = location.hash.match(/^#share=([\w-]{10,})$/);
+  if (!m || !REMOTE || !state.user) return;
+  history.replaceState(null, "", location.pathname + location.search);
+  try {
+    const shared = await repo.getShared(m[1]);
+    const nd = (shared.docs || []).length, ne = (shared.events || []).length;
+    openModal(`
+      <h3>Add this shared course?</h3>
+      <p><b>${esc(shared.code)}</b> ${esc(shared.title || "")}<br>
+        <span class="muted">${esc([shared.instructor, shared.term].filter(Boolean).join(" · "))}${nd || ne ? ` · ${nd} document${nd === 1 ? "" : "s"}, ${ne} deadline${ne === 1 ? "" : "s"}` : ""}</span></p>
+      <div class="modal-actions"><button class="btn" id="shx-no">Not now</button>
+      <button class="btn primary" id="shx-yes">Add to my courses</button></div>`);
+    $("#shx-no").addEventListener("click", closeModal);
+    $("#shx-yes").addEventListener("click", () => importSharedById(shared.id));
+  } catch (_e) { toast("That share link doesn't work anymore.", "err"); }
+}
+
+function openAddCourseManual(startColor) {
   openModal(`
     <h3>Add a course</h3>
     <div class="field"><label>Course code *</label><input id="nc-code" placeholder="CS 2110"></div>
@@ -1535,8 +1751,10 @@ function renderCourse(courseId) {
         <h1 style="color:${esc(c.color)}">${esc(c.code)}</h1>
         <div class="sub">${esc(c.title || "")}${c.term ? " · " + esc(c.term) : ""}${c.instructor ? " · " + esc(c.instructor) : ""}</div>
         ${c.description ? `<div class="sub" style="max-width:560px">${esc(c.description)}</div>` : ""}</div>
-      <div style="display:flex;gap:8px">
-        <button class="btn" id="ask-this">💬 Ask about this course</button>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn" id="ask-this">💬 Ask</button>
+        <button class="btn" id="grades-this">🎯 Grades</button>
+        ${REMOTE ? `<button class="btn" id="share-course" title="Give classmates a one-click copy of this course">📤 Share</button>` : ""}
         <button class="btn" id="edit-course">✏️ Edit</button>
         <button class="btn danger" id="del-course">Delete</button></div>
     </div>
@@ -1614,6 +1832,27 @@ function renderCourse(courseId) {
     </div>`;
 
   $("#ask-this").addEventListener("click", () => { state.askCourse = String(courseId); navigate("ask"); });
+  $("#grades-this").addEventListener("click", () => { state.gradeCourse = String(courseId); navigate("grades"); });
+  const shareBtn = $("#share-course");
+  if (shareBtn) shareBtn.addEventListener("click", async () => {
+    shareBtn.disabled = true;
+    try {
+      const id = await repo.shareCourse(c);
+      const link = `${location.origin}${location.pathname}#share=${id}`;
+      openModal(`
+        <h3>📤 Share ${esc(c.code)}</h3>
+        <p class="muted">Anyone with a SyllabAI account gets this course with one click: syllabus text, course info, deadlines, and skip trackers. They can also find it by searching "${esc(c.code)}" when adding a course.</p>
+        <div class="field"><label>Share link</label><input id="sh-link" readonly value="${esc(link)}"></div>
+        <div class="modal-actions"><button class="btn" id="sh-close">Close</button>
+        <button class="btn primary" id="sh-copy">Copy link</button></div>`);
+      $("#sh-close").addEventListener("click", closeModal);
+      $("#sh-copy").addEventListener("click", async () => {
+        try { await navigator.clipboard.writeText(link); toast("Link copied. Send it to your classmates."); }
+        catch (_e) { $("#sh-link").select(); toast("Copy it from the box.", "err"); }
+      });
+    } catch (err) { toast(err.message, "err"); }
+    shareBtn.disabled = false;
+  });
   $("#del-course").addEventListener("click", async () => {
     if (!confirm(`Delete ${c.code} and all its documents, notes, and events?`)) return;
     await repo.delCourse(courseId);
@@ -1689,11 +1928,13 @@ async function autoDetectSkips(course) {
   for (const note of notesOf(course.id)) texts.push(note.text);
   const combined = texts.join("\n\n");
   let found = extractAllowancesHeuristic(combined);
-  // Signed in with AI: let it read the same pile; its exact numbers win on ties.
+  // Signed in with AI: a dedicated cheap-model pass reads the same pile with an
+  // open-ended brief (any countable allowance, not a fixed list). Its exact
+  // numbers win on label ties.
   if (REMOTE && state.user && texts.length) {
     try {
-      const res = await repo.invokeClaude({ kind: "extract",
-        text: combined.slice(0, 80000), code: course.code, term: course.term || "" });
+      const res = await repo.invokeClaude({ kind: "skips",
+        text: combined.slice(0, 80000), code: course.code });
       if (res && res.result && Array.isArray(res.result.allowances)) {
         found = res.result.allowances.concat(found);
       }
@@ -2055,6 +2296,187 @@ async function openEmailDraft(payload) {
   });
 }
 
+/* ---------- grades ---------- */
+
+const LETTER_CUTS = [[93, "A"], [90, "A-"], [87, "B+"], [83, "B"], [80, "B-"],
+  [77, "C+"], [73, "C"], [70, "C-"], [67, "D+"], [63, "D"], [60, "D-"], [0, "F"]];
+function letterFor(pct) {
+  for (const [cut, letter] of LETTER_CUTS) if (pct >= cut) return letter;
+  return "F";
+}
+function parseWeight(w) {
+  const m = String(w == null ? "" : w).match(/(\d+(?:\.\d+)?)/);
+  return m ? parseFloat(m[1]) : null;
+}
+
+// Rows live in course.grades = { rows: [{name, weight, score}] }. Seeded from
+// the syllabus grading breakdown the first time the tab is opened.
+function gradeRows(course) {
+  if (!course.grades || !Array.isArray(course.grades.rows)) course.grades = { rows: [] };
+  if (!course.grades.rows.length) {
+    const facts = mergeFacts(docsOf(course.id));
+    course.grades.rows = facts.grading
+      .map((g) => ({ name: g.component, weight: parseWeight(g.weight), score: null }))
+      .filter((r) => r.name);
+  }
+  return course.grades.rows;
+}
+
+function syncGradeRows(course) {
+  const rows = gradeRows(course);
+  const have = new Set(rows.map((r) => r.name.toLowerCase().trim()));
+  let added = 0;
+  for (const g of mergeFacts(docsOf(course.id)).grading) {
+    if (!g.component || have.has(g.component.toLowerCase().trim())) continue;
+    rows.push({ name: g.component, weight: parseWeight(g.weight), score: null });
+    added++;
+  }
+  return added;
+}
+
+function gradeMath(rows) {
+  const withW = rows.filter((r) => typeof r.weight === "number" && r.weight > 0);
+  const totalW = withW.reduce((s, r) => s + r.weight, 0);
+  const scored = withW.filter((r) => typeof r.score === "number");
+  const scoredW = scored.reduce((s, r) => s + r.weight, 0);
+  const earned = scored.reduce((s, r) => s + r.weight * r.score / 100, 0);
+  return {
+    totalW, scoredW, remainingW: totalW - scoredW,
+    current: scoredW > 0 ? (earned / scoredW) * 100 : null,
+    // needed average (0-100) on everything not yet scored to end at `target` overall
+    neededFor(target) {
+      if (totalW <= 0) return null;
+      const remaining = totalW - scoredW;
+      if (remaining <= 0) return null;
+      return ((target / 100) * totalW - earned) / remaining * 100;
+    },
+    final: totalW > 0 ? (earned + 0) / totalW * 100 : null, // if all remaining scored 0
+  };
+}
+
+function renderGrades() {
+  if (!state.db.courses.length) {
+    $("#view").innerHTML = `<div class="view-head"><div><h1>Grade calculator</h1></div></div>
+      <div class="empty"><div class="big-ic">🎯</div>Add a course first, then plan your grade here.</div>`;
+    return;
+  }
+  if (!state.gradeCourse || !courseById(state.gradeCourse)) state.gradeCourse = String(state.db.courses[0].id);
+  const c = courseById(state.gradeCourse);
+  const rows = gradeRows(c);
+
+  $("#view").innerHTML = `
+    <div class="view-head">
+      <div><h1>Grade calculator</h1>
+        <div class="sub">Weights come from the syllabus. Type what you've scored, see where you stand, and what the rest needs to be.</div></div>
+    </div>
+    <div class="scope-chips" style="margin-bottom:14px">
+      ${state.db.courses.map((cc) => `<span class="scope-chip ${String(cc.id) === state.gradeCourse ? "sel" : ""}"
+        data-gcourse="${cc.id}" style="${String(cc.id) === state.gradeCourse ? `background:${esc(cc.color)};border-color:${esc(cc.color)};color:#fff` : ""}">${esc(cc.code)}</span>`).join("")}
+    </div>
+    <div class="grades-layout">
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <h3 style="margin:0">${esc(c.code)} components</h3>
+          <span>
+            <button class="btn small" id="gr-sync" title="Pull any components named in the syllabus grading breakdown">⟳ Sync from syllabus</button>
+            <button class="btn small" id="gr-add">＋ Add</button>
+          </span>
+        </div>
+        ${rows.length ? `
+        <div class="grade-table">
+          <div class="gt-head"><span>Component</span><span>Weight %</span><span>Your score %</span><span></span></div>
+          ${rows.map((r, i) => `
+            <div class="gt-row">
+              <input data-gr-name="${i}" value="${esc(r.name)}">
+              <input data-gr-w="${i}" type="number" min="0" max="100" step="0.5" value="${r.weight == null ? "" : r.weight}">
+              <input data-gr-s="${i}" type="number" min="0" max="120" step="0.1" placeholder="—" value="${r.score == null ? "" : r.score}">
+              <button class="btn small danger" data-gr-del="${i}">✕</button>
+            </div>`).join("")}
+        </div>
+        <p class="muted" style="font-size:12px">Leave the score blank for anything not graded yet. Category averages work fine (your homework average so far).</p>`
+        : `<p class="muted">No grading breakdown found. Upload the syllabus, hit Sync, or add components by hand.</p>`}
+      </div>
+      <div class="card grade-readout" id="grade-readout"></div>
+    </div>`;
+
+  const persist = () => repo.updateCourse(c, { grades: c.grades }).catch((e) => toast(e.message, "err"));
+
+  const readRow = (i) => {
+    const w = $(`[data-gr-w="${i}"]`).value, s = $(`[data-gr-s="${i}"]`).value;
+    rows[i].name = $(`[data-gr-name="${i}"]`).value.slice(0, 60);
+    rows[i].weight = w === "" ? null : Math.max(0, parseFloat(w) || 0);
+    rows[i].score = s === "" ? null : Math.max(0, parseFloat(s) || 0);
+  };
+
+  const readout = () => {
+    const m = gradeMath(rows);
+    const target = c.grades.target == null ? 90 : c.grades.target;
+    const remaining = rows.filter((r) => typeof r.weight === "number" && r.weight > 0 && typeof r.score !== "number");
+    const needed = m.neededFor(target);
+    let plan = "";
+    if (m.totalW <= 0) plan = `<p class="muted">Give your components weights first.</p>`;
+    else if (!remaining.length) plan = `<p>Everything is graded. ${m.current == null ? "" : `Final: <b>${m.current.toFixed(1)}%</b> (${letterFor(m.current)}).`}</p>`;
+    else {
+      const list = remaining.map((r) => `${esc(r.name)} (${r.weight}%)`).join(", ");
+      const tone = needed > 100 ? "bad" : needed <= 0 ? "locked" : needed > 90 ? "warn" : "ok";
+      plan = `
+        <div class="plan-line ${tone}">
+          ${needed <= 0 ? `🎉 Locked in: even 0% on the rest keeps you at ${letterFor(target)} target.`
+          : needed > 100 ? `Not possible on scores alone: the rest averages out above 100% (${needed.toFixed(1)}%). Time for extra credit or a lower target.`
+          : `You need to average <b>${needed.toFixed(1)}%</b> across the remaining ${m.remainingW.toFixed(0)}% of the course.`}
+        </div>
+        <p class="muted" style="font-size:12.5px">Remaining: ${list}</p>`;
+    }
+    $("#grade-readout").innerHTML = `
+      <h3>Where you stand</h3>
+      ${m.current == null ? `<p class="muted">Enter at least one score.</p>` : `
+        <div class="big-grade" style="color:${needed != null && needed > 100 ? "var(--red)" : "inherit"}">${m.current.toFixed(1)}%
+          <span class="letter">${letterFor(m.current)}</span></div>
+        <p class="muted" style="font-size:12.5px">Average so far, covering ${m.scoredW.toFixed(0)}% of the course${m.totalW < 99.5 ? ` (weights add to ${m.totalW.toFixed(0)}%)` : ""}.</p>`}
+      <div class="target-row">
+        <span class="muted" style="font-size:12.5px">Target:</span>
+        ${[["A", 93], ["A-", 90], ["B+", 87], ["B", 83]].map(([l, v]) =>
+          `<button class="btn small tgt ${target === v ? "primary" : ""}" data-tgt="${v}">${l}</button>`).join("")}
+        <input id="tgt-custom" type="number" min="0" max="110" value="${target}" title="Custom target %"> %
+      </div>
+      ${plan}`;
+    $$("[data-tgt]").forEach((b) => b.addEventListener("click", () => {
+      c.grades.target = Number(b.dataset.tgt);
+      $("#tgt-custom").value = c.grades.target;
+      readout(); persist();
+    }));
+    $("#tgt-custom").addEventListener("change", () => {
+      c.grades.target = Math.max(0, Math.min(110, parseFloat($("#tgt-custom").value) || 90));
+      readout(); persist();
+    });
+  };
+  readout();
+
+  rows.forEach((_r, i) => {
+    ["gr-name", "gr-w", "gr-s"].forEach((kind) => {
+      const el = $(`[data-${kind}="${i}"]`);
+      el.addEventListener("input", () => { readRow(i); readout(); });
+      el.addEventListener("change", () => { readRow(i); persist(); });
+    });
+    $(`[data-gr-del="${i}"]`).addEventListener("click", () => {
+      rows.splice(i, 1); persist(); renderGrades();
+    });
+  });
+  $("#gr-add").addEventListener("click", () => {
+    rows.push({ name: "New component", weight: null, score: null });
+    persist(); renderGrades();
+  });
+  $("#gr-sync").addEventListener("click", () => {
+    const added = syncGradeRows(c);
+    toast(added ? `Pulled ${added} component${added === 1 ? "" : "s"} from the syllabus.` : "Nothing new in the syllabus breakdown.");
+    if (added) { persist(); renderGrades(); }
+  });
+  $$("[data-gcourse]").forEach((chip) => chip.addEventListener("click", () => {
+    state.gradeCourse = chip.dataset.gcourse;
+    renderGrades();
+  }));
+}
+
 /* ---------- calendar ---------- */
 
 function renderCalendar() {
@@ -2081,13 +2503,13 @@ function renderCalendar() {
 
   $("#view").innerHTML = `
     <div class="view-head">
-      <div><h1>Calendar</h1><div class="sub">Every deadline pulled from your syllabi and notes, plus anything you add or import.</div></div>
+      <div><h1>Calendar</h1><div class="sub">Every deadline pulled from your syllabi, notes, and feeds.</div></div>
       <div style="display:flex;gap:8px;flex-wrap:wrap">
-        <button class="btn" id="import-ics">⇪ Import .ics</button>
-        <button class="btn" id="export-ics">⬇ Export .ics</button>
+        ${REMOTE ? `<button class="btn" id="subscribe-feed">📡 Canvas feed</button>` : ""}
+        ${REMOTE && state.db.feeds.length ? `<button class="btn" id="refresh-feeds">⟳ Refresh</button>` : ""}
         <button class="btn primary" id="add-event">+ Event</button></div>
     </div>
-    <p class="muted" style="margin:-8px 0 14px">💡 Canvas users: in Canvas go to Calendar → Calendar Feed, download the .ics file, then hit Import here. Every homework and quiz shows up right on this page.</p>
+    ${REMOTE && !state.db.feeds.length ? `<p class="muted" style="margin:-8px 0 14px">💡 Hook up your Canvas calendar feed once and every assignment date lands here automatically. Hit 📡 Canvas feed.</p>` : ""}
     <div class="cal-head">
       <button class="btn small" id="cal-prev">←</button><h2>${esc(monthName)}</h2>
       <button class="btn small" id="cal-next">→</button><button class="btn small" id="cal-today">Today</button>
@@ -2117,15 +2539,81 @@ function renderCalendar() {
     renderCalendar();
   }));
   $("#add-event").addEventListener("click", openAddEvent);
-  $("#import-ics").addEventListener("click", openImportIcs);
-  $("#export-ics").addEventListener("click", () => {
-    const blob = new Blob([generateIcs(state.db.events, "SyllabAI")], { type: "text/calendar" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = "syllabai.ics";
-    a.click();
-    URL.revokeObjectURL(a.href);
-    toast("Downloaded. Import it into Google/Apple/Outlook calendar.");
+  const sub = $("#subscribe-feed");
+  if (sub) sub.addEventListener("click", openSubscribeFeed);
+  const rf = $("#refresh-feeds");
+  if (rf) rf.addEventListener("click", async () => {
+    rf.disabled = true;
+    await refreshFeeds(false);
+    renderCalendar();
+  });
+}
+
+/* ---- Canvas/Moodle calendar feeds ---- */
+
+function courseForTitle(title) {
+  const t = String(title).toLowerCase().replace(/\s+/g, "");
+  for (const c of state.db.courses) {
+    const compact = c.code.toLowerCase().replace(/\s+/g, "");
+    const subj = (c.code.toLowerCase().match(/^[a-z]+/) || [""])[0];
+    const num = (c.code.match(/\d{3,}/) || [""])[0];
+    if (compact.length > 2 && t.includes(compact)) return c.id;
+    if (subj.length >= 2 && num && t.includes(subj) && t.includes(num)) return c.id;
+  }
+  return null;
+}
+
+async function refreshFeeds(silent) {
+  if (!REMOTE || !state.db.feeds.length) return 0;
+  let total = 0, failed = 0;
+  for (const feed of state.db.feeds) {
+    try {
+      const res = await repo.invokeClaude({ kind: "ics", url: feed.url });
+      if (!res || res.error || !res.text) { failed++; continue; }
+      const events = parseIcs(res.text);
+      const groups = new Map();
+      for (const ev of events) {
+        const cid = courseForTitle(ev.title);
+        if (!groups.has(cid)) groups.set(cid, []);
+        groups.get(cid).push(ev);
+      }
+      for (const [cid, evs] of groups) total += await repo.addEventsBulk(cid, null, evs, "canvas");
+    } catch (_e) { failed++; }
+  }
+  if (!silent) {
+    if (failed && !total) toast("Couldn't refresh the feed. Check the URL, and make sure the latest edge function is deployed.", "err");
+    else toast(total ? `Pulled ${total} new deadline${total === 1 ? "" : "s"} from your feed${state.db.feeds.length === 1 ? "" : "s"}.` : "Feeds are up to date.");
+  }
+  return total;
+}
+
+function openSubscribeFeed() {
+  openModal(`
+    <h3>📡 Subscribe to your Canvas calendar</h3>
+    <p class="muted">In Canvas: Calendar → <b>Calendar Feed</b> (bottom of the right sidebar) → copy the link. Paste it once and every assignment date flows in here; Refresh pulls anything new. Moodle and Blackboard feeds work too.</p>
+    <div class="field"><label>Feed URL</label><input id="fd-url" placeholder="https://canvas…/feeds/calendars/user_….ics"></div>
+    ${state.db.feeds.length ? `<div class="field"><label>Your feeds</label>${state.db.feeds.map((f) => `
+      <div class="doc-row" style="cursor:default"><span>📡</span>
+        <div class="name" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:330px">${esc(f.url)}</div>
+        <div class="spacer"></div><button class="btn small danger" data-del-feed="${f.id}">✕</button></div>`).join("")}</div>` : ""}
+    <div class="modal-actions"><button class="btn" id="fd-cancel">Close</button>
+    <button class="btn primary" id="fd-save">Subscribe & pull now</button></div>`);
+  $("#fd-cancel").addEventListener("click", closeModal);
+  $$("[data-del-feed]").forEach((b) => b.addEventListener("click", async () => {
+    try { await repo.delFeed(b.dataset.delFeed); } catch (err) { return toast(err.message, "err"); }
+    openSubscribeFeed();
+  }));
+  $("#fd-save").addEventListener("click", async () => {
+    const url = $("#fd-url").value.trim().replace(/^webcal:\/\//i, "https://");
+    if (!/^https:\/\/.+/.test(url)) return toast("Paste the https feed link from Canvas.", "err");
+    const btn = $("#fd-save");
+    btn.disabled = true;
+    try {
+      await repo.addFeed(url.slice(0, 500));
+      closeModal();
+      await refreshFeeds(false);
+      renderCalendar();
+    } catch (err) { toast(err.message, "err"); btn.disabled = false; }
   });
 }
 
@@ -2203,6 +2691,8 @@ function renderSettings() {
           <div class="kv"><span class="k">Name</span><span>${esc(state.user.name)}</span></div>
           <div class="kv"><span class="k">Email</span><span>${esc(state.user.email)}</span></div>
           ${state.usage.on ? `<div class="kv"><span class="k">AI answers</span><span>${state.usage.left} of ${state.usage.limit} left today</span></div>` : ""}
+          <label class="kv" style="cursor:pointer"><span class="k">Weekly digest email</span>
+            <input type="checkbox" id="digest-toggle" checked></label>
           <div style="display:flex;gap:8px;margin-top:12px">
             <button class="btn" id="clear-history">Clear Q&A history</button>
             <button class="btn danger" id="logout">Sign out</button>
@@ -2213,10 +2703,36 @@ function renderSettings() {
             <button class="btn danger" id="wipe">Erase everything</button>
           </div>`}
       </div>
+      <div class="card">
+        <h3>🗓 Calendar data</h3>
+        <p class="muted">Canvas feed subscriptions live on the Calendar tab. These are for one-off files.</p>
+        <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+          <button class="btn" id="import-ics">⇪ Import .ics file</button>
+          <button class="btn" id="export-ics">⬇ Export everything (.ics)</button>
+        </div>
+      </div>
     </div>`;
 
   $("#theme-light").addEventListener("click", () => { applyTheme("light"); renderSettings(); });
   $("#theme-dark").addEventListener("click", () => { applyTheme("dark"); renderSettings(); });
+  $("#import-ics").addEventListener("click", openImportIcs);
+  $("#export-ics").addEventListener("click", () => {
+    const blob = new Blob([generateIcs(state.db.events, "SyllabAI")], { type: "text/calendar" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "syllabai.ics";
+    a.click();
+    URL.revokeObjectURL(a.href);
+    toast("Downloaded. Import it into Google/Apple/Outlook calendar.");
+  });
+  const dig = $("#digest-toggle");
+  if (dig) {
+    repo.getDigestPref().then((v) => { dig.checked = v; }).catch(() => {});
+    dig.addEventListener("change", async () => {
+      try { await repo.setDigestPref(dig.checked); toast(dig.checked ? "Weekly digest on." : "Weekly digest off."); }
+      catch (err) { toast(err.message, "err"); dig.checked = !dig.checked; }
+    });
+  }
   $("#clear-history").addEventListener("click", async () => {
     await repo.clearChats();
     toast("History cleared.");
@@ -2296,6 +2812,10 @@ async function enterApp() {
   renderAiPill();
   await repo.loadAll();
   navigate("dashboard");
+  handleShareHash();
+  refreshFeeds(true).then((n) => {
+    if (n) toast(`${n} new deadline${n === 1 ? "" : "s"} pulled from your Canvas feed.`);
+  }).catch(() => {});
 }
 
 $$("#nav .nav-item").forEach((a) => a.addEventListener("click", () => navigate(a.dataset.view)));

@@ -32,3 +32,26 @@ all data access is locked down per-user by row level security.)
 
 Push to GitHub, wait a minute for Pages to rebuild, done: the live site now has
 sign-ups, per-user data, and AI answers on your key with daily limits.
+
+## Keeping it updated
+
+When `supabase/schema.sql` or `supabase/functions/claude/index.ts` change in this
+repo, re-run / re-paste them the same way as steps 3 and 4. Both are safe to
+re-apply; the schema only adds what's missing.
+
+## Optional: weekly digest email
+
+Every Sunday evening, users get one email with the week's deadlines and their
+skips remaining. Free, but it needs a sender:
+
+1. Create a free account at brevo.com (300 emails/day free) and verify a sender
+   email address (Settings → Senders).
+2. Get an API key (SMTP & API → API keys).
+3. **Edge Functions → Deploy a new function → Via Editor**, name it exactly
+   `digest`, paste `supabase/functions/digest/index.ts`, Deploy.
+4. **Edge Functions → Secrets**: add `BREVO_API_KEY` (the key), `BREVO_FROM`
+   (the verified sender email), and `DIGEST_SECRET` (any long random string).
+5. **SQL Editor**: paste `supabase/digest-schedule.sql`, replace the two
+   placeholders (your project ref and your DIGEST_SECRET), Run.
+
+Users can opt out any time in the app: Settings → Weekly digest email.

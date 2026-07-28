@@ -1,6 +1,7 @@
 // SyllabAI edge function: the ONLY place the Anthropic API key lives.
-// Handles kind = "status" | "ask" | "extract" | "draft".
+// Handles kind = "status" | "ask" | "extract" | "draft" | "skips" | "ics".
 // Enforces a per-user daily AI-call limit stored in public.ai_usage.
+// "ics" is a free calendar-feed proxy (no AI, no usage charge).
 //
 // Secrets required (Edge Functions -> Secrets):
 //   ANTHROPIC_API_KEY        your key (sk-ant-...)
@@ -12,6 +13,9 @@
 import { createClient } from "npm:@supabase/supabase-js@2";
 
 const MODEL = "claude-opus-5";
+// Cheap model for narrow extraction jobs (the skips scan). Answer quality for
+// real Q&A stays on MODEL above.
+const CHEAP_MODEL = "claude-haiku-4-5";
 const LIMIT = parseInt(Deno.env.get("MYSYLLABI_DAILY_LIMIT") ?? "25", 10);
 const API_KEY = Deno.env.get("ANTHROPIC_API_KEY") ?? "";
 
@@ -117,6 +121,25 @@ const FACTS_SCHEMA = {
   },
 };
 
+const SKIPS_SYSTEM = `You hunt through a student's course materials for every countable per-semester allowance the course grants them. Think carefully and read everything: syllabi, policies, and the student's own notes about what the professor said.
+
+An allowance is ANY finite, numbered budget of forgiveness, of any kind. Common shapes: dropped lowest scores, permitted absences or lecture misses, slip or grace or late days, free quiz misses, homework passes, token systems, revision or resubmission chances, excused skips. Do NOT limit yourself to these examples; if the materials grant a countable number of anything forgivable, include it.
+
+Rules:
+- Only include allowances with an explicit number actually stated in the materials. "lowest homework dropped" is total 1. "two lowest quiz scores dropped" is total 2. Never infer or assume a number.
+- Penalties are not allowances ("10% off per late day" grants nothing, "after 4 absences you fail" is a threshold, not a grant of 4).
+- label: short and student-facing ("Homework drops", "Slip days", "Class skips", "Late tokens").
+- One entry per distinct allowance. [] if none.`;
+
+const SKIPS_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["allowances"],
+  properties: {
+    allowances: { type: "array", items: { type: "object", additionalProperties: false,
+      required: ["label", "total"],
+      properties: { label: { type: "string" }, total: { type: "integer" } } } },
+  },
+};
+
 const EMAIL_SYSTEM = `You draft a short, respectful email from a student to their course staff.
 
 Rules:
@@ -134,7 +157,11 @@ const EMAIL_SCHEMA = {
 
 // ---------------------------------------------------------------- anthropic
 
-async function callClaude(system: string, user: string, maxTokens: number, effort: string, schema: unknown) {
+async function callClaude(system: string, user: string, maxTokens: number, effort: string, schema: unknown, model = MODEL) {
+  // effort is only sent to models that support it; the cheap model gets the
+  // schema constraint alone.
+  const outputConfig: Record<string, unknown> = { format: { type: "json_schema", schema } };
+  if (model === MODEL) outputConfig.effort = effort;
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -143,11 +170,11 @@ async function callClaude(system: string, user: string, maxTokens: number, effor
       "anthropic-version": "2023-06-01",
     },
     body: JSON.stringify({
-      model: MODEL,
+      model,
       max_tokens: maxTokens,
       system,
       messages: [{ role: "user", content: user }],
-      output_config: { effort, format: { type: "json_schema", schema } },
+      output_config: outputConfig,
     }),
   });
   const data = await res.json().catch(() => ({}));
@@ -191,6 +218,30 @@ Deno.serve(async (req) => {
   const usage = { on: Boolean(API_KEY), limit: LIMIT, used, left: Math.max(0, LIMIT - used) };
 
   if (kind === "status") return json({ usage });
+
+  // Free calendar-feed proxy: fetches a Canvas/Moodle .ics feed the browser
+  // can't reach because of CORS. No AI involved, no usage charge.
+  if (kind === "ics") {
+    try {
+      const raw = String(body.url || "").replace(/^webcal:\/\//i, "https://");
+      const url = new URL(raw);
+      const host = url.hostname;
+      if (url.protocol !== "https:") throw new Error("Feed URL must be https.");
+      if (host === "localhost" || /^[\d.:[\]]+$/.test(host)) throw new Error("That host is not allowed.");
+      const res = await fetch(url.toString(), {
+        headers: { "user-agent": "SyllabAI calendar sync" },
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!res.ok) throw new Error(`Feed returned ${res.status}`);
+      const text = (await res.text()).slice(0, 2_000_000);
+      if (!text.includes("BEGIN:VCALENDAR")) throw new Error("That URL is not a calendar feed.");
+      return json({ text, usage });
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      return json({ error: `Feed fetch failed: ${message.slice(0, 200)}`, usage }, 200);
+    }
+  }
+
   if (!API_KEY) return json({ limited: true, reason: "no_key", usage });
   if (used >= LIMIT) return json({ limited: true, reason: "limit", usage });
 
@@ -226,6 +277,17 @@ Deno.serve(async (req) => {
       const result = await callClaude(
         FACTS_SYSTEM.replace("{today}", today).replace("{term}", term),
         `SYLLABUS for ${code}:\n\n${text}`, 12000, "medium", FACTS_SCHEMA);
+      return json({ result, usage });
+    }
+
+    if (kind === "skips") {
+      const text = String(body.text || "").slice(0, 80000);
+      const code = String(body.code || "this course").slice(0, 60);
+      if (text.length < 20) return json({ error: "No text." }, 400);
+      const result = await callClaude(
+        SKIPS_SYSTEM,
+        `ALL MATERIALS AND NOTES for ${code}:\n\n${text}`,
+        2000, "medium", SKIPS_SCHEMA, CHEAP_MODEL);
       return json({ result, usage });
     }
 

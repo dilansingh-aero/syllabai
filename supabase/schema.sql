@@ -6,6 +6,7 @@ create extension if not exists pgcrypto;
 -- Upgrades for databases created before these columns existed (safe to re-run).
 alter table if exists public.courses add column if not exists description text not null default '';
 alter table if exists public.courses add column if not exists facts_override jsonb not null default '{}';
+alter table if exists public.courses add column if not exists grades jsonb not null default '{}';
 
 -- ---------------------------------------------------------------- courses
 create table if not exists public.courses (
@@ -18,6 +19,7 @@ create table if not exists public.courses (
   color text not null default '#4f46e5',
   description text not null default '',
   facts_override jsonb not null default '{}',
+  grades jsonb not null default '{}',
   allowances jsonb not null default '[]',
   created_at timestamptz not null default now()
 );
@@ -95,6 +97,41 @@ create table if not exists public.ai_usage (
   primary key (user_id, day)
 );
 
+-- ---------------------------------------------------------------- shared courses
+-- Public snapshots for one-click imports: any signed-in student can search
+-- them and copy one into their own account. Text-only (no original files).
+create table if not exists public.shared_courses (
+  id uuid primary key default gen_random_uuid(),
+  owner_id uuid not null references auth.users(id) on delete cascade,
+  code text not null,
+  title text not null default '',
+  term text not null default '',
+  instructor text not null default '',
+  color text not null default '#4f46e5',
+  description text not null default '',
+  allowances jsonb not null default '[]',
+  docs jsonb not null default '[]',
+  events jsonb not null default '[]',
+  created_at timestamptz not null default now()
+);
+create index if not exists idx_shared_code on public.shared_courses(code);
+
+-- ---------------------------------------------------------------- calendar feeds
+-- Saved Canvas/Moodle calendar-feed URLs, refreshed through the edge function.
+create table if not exists public.feeds (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  url text not null,
+  added_at timestamptz not null default now()
+);
+
+-- ---------------------------------------------------------------- digest opt-out
+-- Weekly email digest preference (default on; row only written when toggled).
+create table if not exists public.digest_prefs (
+  user_id uuid primary key references auth.users(id) on delete cascade,
+  enabled boolean not null default true
+);
+
 -- ---------------------------------------------------------------- feedback
 -- Users drop ideas here; read them in Table Editor -> feedback. The app also
 -- opens the sender's mail app addressed to the owner.
@@ -115,6 +152,39 @@ alter table public.chat_sessions enable row level security;
 alter table public.chats enable row level security;
 alter table public.ai_usage enable row level security;
 alter table public.feedback enable row level security;
+alter table public.shared_courses enable row level security;
+alter table public.feeds enable row level security;
+alter table public.digest_prefs enable row level security;
+
+do $$ begin
+  create policy "shared readable" on public.shared_courses
+    for select to authenticated using (true);
+exception when duplicate_object then null; end $$;
+
+do $$ begin
+  create policy "shared write own" on public.shared_courses
+    for insert to authenticated with check (auth.uid() = owner_id);
+exception when duplicate_object then null; end $$;
+
+do $$ begin
+  create policy "shared update own" on public.shared_courses
+    for update to authenticated using (auth.uid() = owner_id) with check (auth.uid() = owner_id);
+exception when duplicate_object then null; end $$;
+
+do $$ begin
+  create policy "shared delete own" on public.shared_courses
+    for delete to authenticated using (auth.uid() = owner_id);
+exception when duplicate_object then null; end $$;
+
+do $$ begin
+  create policy "own feeds" on public.feeds
+    for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+exception when duplicate_object then null; end $$;
+
+do $$ begin
+  create policy "own digest pref" on public.digest_prefs
+    for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+exception when duplicate_object then null; end $$;
 
 do $$ begin
   create policy "own courses" on public.courses
