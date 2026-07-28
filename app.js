@@ -320,7 +320,7 @@ function extractFactsHeuristic(text) {
 const WORDNUM = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10 };
 function toNum(s) { return WORDNUM[String(s).toLowerCase()] || parseInt(s, 10) || 0; }
 const NUMPAT = "\\d+|one|two|three|four|five|six|seven|eight|nine|ten";
-const SUBJPAT = "homework|hw|assignment|problem set|pset|quiz(?:zes)?|quiz|lab|reading|discussion";
+const SUBJPAT = "homework|hw|assignment|problem set|pset|quiz(?:zes)?|quiz|lab|tutorial|reading|discussion";
 
 function normSubject(s) {
   const l = String(s || "").toLowerCase();
@@ -347,7 +347,9 @@ function extractAllowancesHeuristic(text) {
   let m;
   if ((m = text.match(new RegExp(`(${NUMPAT})\\s+(?:free\\s+)?slip days?`, "i")))) add("Slip days", toNum(m[1]));
   if ((m = text.match(new RegExp(`(${NUMPAT})\\s+(?:free\\s+)?(?:grace|late) days?`, "i")))) add("Late days", toNum(m[1]));
-  if ((m = text.match(new RegExp(`miss (?:up to )?(${NUMPAT})\\s+(?:lectures?|classes)`, "i")))) add("Class skips", toNum(m[1]));
+  if ((m = text.match(new RegExp(`miss (?:up to )?(${NUMPAT})\\s+(lectures?|classes|tutorials?|labs?|sessions?|discussions?)`, "i")))) {
+    add(/tutorial/i.test(m[2]) ? "Tutorial skips" : /lab/i.test(m[2]) ? "Lab skips" : "Class skips", toNum(m[1]));
+  }
   if ((m = text.match(new RegExp(`(${NUMPAT})\\s+(?:unexcused |excused )?absences?(?:\\s+(?:are\\s+)?(?:allowed|permitted))?`, "i")))
     && /unexcused|excused|allowed|permitted/.test(m[0])) add("Absences", toNum(m[1]));
   if ((m = text.match(new RegExp(`(${NUMPAT})\\s+free (?:passes|skips|absences)`, "i")))) add("Free passes", toNum(m[1]));
@@ -369,7 +371,7 @@ function extractAllowancesHeuristic(text) {
   }
 
   // "two lowest homework scores are dropped"
-  const lowDropRe = new RegExp(`(?:(${NUMPAT})\\s+)?lowest\\s+(${SUBJPAT})?\\s*(?:scores?|grades?)?\\s*(?:is|are|will be)?\\s*dropped`, "gi");
+  const lowDropRe = new RegExp(`(?:(${NUMPAT})\\s+)?lowest\\s+(${SUBJPAT})?\\s*(?:scores?|grades?|marks?)?\\s*(?:is|are|will be)?\\s*dropped`, "gi");
   while ((m = lowDropRe.exec(text))) {
     const subject = m[2] ? normSubject(m[2]) : "";
     add(subject ? `${subject} drops` : "Dropped scores", m[1] ? toNum(m[1]) : 1);
@@ -530,6 +532,35 @@ async function extractFile(file) {
     return { text: await file.text(), kind: "txt" };
   }
   throw new Error("Unsupported file type. Upload a .pdf, .docx, .txt, or .md file.");
+}
+
+const UPLOADABLE_RE = /\.(pdf|docx|txt|md)$/i;
+
+// Turn a drop into a flat file list, walking folders (course-outline packs).
+// Entries must be grabbed before the first await or the DataTransfer goes stale.
+async function collectFiles(dt) {
+  const out = [];
+  const entries = dt.items
+    ? [...dt.items].map((it) => it.webkitGetAsEntry && it.webkitGetAsEntry()).filter(Boolean)
+    : [];
+  const plainFiles = [...(dt.files || [])];
+  const walk = async (entry) => {
+    if (out.length >= 12 || !entry) return;
+    if (entry.isFile) {
+      const f = await new Promise((res) => entry.file(res, () => res(null)));
+      if (f && UPLOADABLE_RE.test(f.name)) out.push(f);
+    } else if (entry.isDirectory) {
+      const reader = entry.createReader();
+      let batch;
+      do {
+        batch = await new Promise((res) => reader.readEntries(res, () => res([])));
+        for (const e of batch) await walk(e);
+      } while (batch.length && out.length < 12);
+    }
+  };
+  if (entries.length) for (const e of entries) await walk(e);
+  else for (const f of plainFiles) if (UPLOADABLE_RE.test(f.name)) out.push(f);
+  return out.slice(0, 12);
 }
 
 function normalizeWs(s) { return s.replace(/\s+/g, " ").trim().toLowerCase(); }
@@ -1381,11 +1412,13 @@ function openAddCourse() {
   const startColor = COURSE_COLORS[state.db.courses.length % COURSE_COLORS.length];
   openModal(`
     <h3>Add a course</h3>
-    <p style="margin:4px 0 10px"><b>Fastest:</b> drop the syllabus. Code, title, course info, deadlines, and skip trackers all fill in automatically.</p>
+    <p style="margin:4px 0 10px"><b>Fastest:</b> drop the syllabus or course outline. Code, title, course info, deadlines, and skip trackers all fill in automatically.</p>
     <div class="field"><label>Color</label>${colorSelectHtml("ac-color", startColor)}</div>
     <div class="dropzone" id="ac-drop">
-      <b>Drop the syllabus here</b> or <a id="ac-browse">browse</a> — PDF, Word, or text
-      <input type="file" id="ac-file" accept=".pdf,.docx,.txt,.md" style="display:none">
+      <b>Drop files or a whole course folder here</b><br>
+      or <a id="ac-browse">browse files</a> · <a id="ac-folder-link">choose a folder</a> — PDF, Word, or text
+      <input type="file" id="ac-file" accept=".pdf,.docx,.txt,.md" multiple style="display:none">
+      <input type="file" id="ac-folder" webkitdirectory style="display:none">
     </div>
     ${REMOTE ? `
     <div class="add-divider">or grab a course a classmate shared</div>
@@ -1399,28 +1432,49 @@ function openAddCourse() {
   const getColor = bindColorSelect("ac-color");
   $("#ac-cancel").addEventListener("click", closeModal);
   $("#ac-manual").addEventListener("click", () => openAddCourseManual(getColor()));
-  const fi = $("#ac-file"), dz = $("#ac-drop");
+  const fi = $("#ac-file"), fo = $("#ac-folder"), dz = $("#ac-drop");
   $("#ac-browse").addEventListener("click", () => fi.click());
-  const start = (file) => { if (file) addCourseFromFile(file, getColor()); };
-  fi.addEventListener("change", () => start(fi.files[0]));
+  $("#ac-folder-link").addEventListener("click", () => fo.click());
+  const start = (files) => { if (files && files.length) addCourseFromFiles(files, getColor()); };
+  fi.addEventListener("change", () => start([...fi.files]));
+  fo.addEventListener("change", () => start([...fo.files].filter((f) => UPLOADABLE_RE.test(f.name))));
   ["dragover", "dragenter"].forEach((n) => dz.addEventListener(n, (e) => { e.preventDefault(); dz.classList.add("drag"); }));
   ["dragleave", "drop"].forEach((n) => dz.addEventListener(n, (e) => { e.preventDefault(); dz.classList.remove("drag"); }));
-  dz.addEventListener("drop", (e) => start(e.dataTransfer.files && e.dataTransfer.files[0]));
+  dz.addEventListener("drop", (e) => { collectFiles(e.dataTransfer).then(start); });
   if (REMOTE) bindSharedSearch();
 }
 
-async function addCourseFromFile(file, color) {
-  openModal(`<h3>Reading ${esc(file.name)}…</h3><p class="muted">Pulling out the course, its info, deadlines, and skips.</p>`);
+// One file or a whole folder: the outline/syllabus (by name, else the first
+// readable file) names the course and gets the AI extract; the rest ingest
+// with free heuristics so a 10-file folder still costs one AI call.
+async function addCourseFromFiles(files, color) {
+  files = files.slice(0, 12);
+  if (!files.length) return toast("No PDF, Word, or text files in that.", "err");
+  openModal(`<h3>Reading ${files.length === 1 ? esc(files[0].name) : files.length + " files"}…</h3>
+    <p class="muted">Pulling out the course, its info, deadlines, and skips.</p>`);
+  const extracted = [];
+  for (const f of files) {
+    try { extracted.push({ file: f, ...(await extractFile(f)) }); }
+    catch (_e) { /* one unreadable file shouldn't sink the folder */ }
+  }
+  if (!extracted.length) {
+    closeModal(); toast("Couldn't read any of those files.", "err");
+    return openAddCourse();
+  }
+  const primary = extracted.find((x) => /outline|syllabus/i.test(x.file.name)) || extracted[0];
   try {
-    const { text, kind } = await extractFile(file);
-    const meta = guessCourseMeta(text, file.name);
+    const meta = guessCourseMeta(primary.text, primary.file.name);
     const course = await repo.addCourse({
-      code: meta.code || file.name.replace(/\.[^.]+$/, "").slice(0, 40) || "New course",
+      code: meta.code || primary.file.name.replace(/\.[^.]+$/, "").slice(0, 40) || "New course",
       title: meta.title, term: meta.term, instructor: meta.instructor, color });
-    const { eventsAdded, allowancesAdded } = await ingestDocument(course, file.name, text, kind, false, file);
+    let ev = 0, al = 0;
+    for (const x of extracted) {
+      const r = await ingestDocument(course, x.file.name, x.text, x.kind, x !== primary, x.file);
+      ev += r.eventsAdded; al += r.allowancesAdded;
+    }
     closeModal();
-    toast(`${course.code} is set up: course info filled, ${eventsAdded} deadline${eventsAdded === 1 ? "" : "s"}`
-      + (allowancesAdded ? ` and ${allowancesAdded} skip tracker${allowancesAdded === 1 ? "" : "s"}` : "") + " added.");
+    toast(`${course.code} is set up: ${extracted.length} document${extracted.length === 1 ? "" : "s"}, ${ev} deadline${ev === 1 ? "" : "s"}`
+      + (al ? `, ${al} skip tracker${al === 1 ? "" : "s"}` : "") + ".");
     navigate("course", course.id);
   } catch (err) { closeModal(); toast(err.message, "err"); openAddCourse(); }
 }
@@ -1815,9 +1869,9 @@ function renderCourse(courseId) {
           <button class="btn small danger" data-del-doc="${d.id}">Remove</button>
         </div>`).join("") || `<p class="muted" style="margin:4px">No documents yet.</p>`}
       <div class="dropzone" id="dropzone">
-        <b>Drop a syllabus here</b> or <a id="browse">browse</a> — PDF, Word, or text.<br>
+        <b>Drop syllabus, course outline, or any course files here</b> or <a id="browse">browse</a> — PDF, Word, or text. Folders and multiple files work.<br>
         <span style="font-size:12.5px">Deadlines are auto-added to your calendar; key policies fill the course info.</span>
-        <input type="file" id="file-input" accept=".pdf,.docx,.txt,.md" style="display:none">
+        <input type="file" id="file-input" accept=".pdf,.docx,.txt,.md" multiple style="display:none">
       </div>
     </div>
 
@@ -1910,10 +1964,10 @@ function renderCourse(courseId) {
 
   const dz = $("#dropzone"), fi = $("#file-input");
   $("#browse").addEventListener("click", () => fi.click());
-  fi.addEventListener("change", () => fi.files[0] && uploadFile(courseId, fi.files[0]));
+  fi.addEventListener("change", () => uploadFiles(courseId, [...fi.files]));
   ["dragover", "dragenter"].forEach((n) => dz.addEventListener(n, (e) => { e.preventDefault(); dz.classList.add("drag"); }));
   ["dragleave", "drop"].forEach((n) => dz.addEventListener(n, (e) => { e.preventDefault(); dz.classList.remove("drag"); }));
-  dz.addEventListener("drop", (e) => { const f = e.dataTransfer.files && e.dataTransfer.files[0]; if (f) uploadFile(courseId, f); });
+  dz.addEventListener("drop", (e) => { collectFiles(e.dataTransfer).then((files) => uploadFiles(courseId, files)); });
 }
 
 async function autoDetectSkips(course) {
@@ -2038,15 +2092,25 @@ function openAddAllowance(course, onSave) {
   });
 }
 
-async function uploadFile(courseId, file) {
+// Multiple files at once are fine; with several, only the outline/syllabus
+// (by name, else the first) spends an AI call, the rest use free heuristics.
+async function uploadFiles(courseId, files) {
+  files = (files || []).slice(0, 12);
+  if (!files.length) return;
   const dz = $("#dropzone");
-  if (dz) dz.innerHTML = `<b>Reading ${esc(file.name)}…</b> extracting policies & deadlines`;
-  try {
-    const { text, kind } = await extractFile(file);
-    const { doc, eventsAdded, allowancesAdded } = await ingestDocument(courseById(courseId), file.name, text, kind, false, file);
-    toast(`Indexed ${doc.chunks.length} sections, added ${eventsAdded} calendar events`
-      + (allowancesAdded ? `, set up ${allowancesAdded} skip tracker${allowancesAdded === 1 ? "" : "s"}.` : "."));
-  } catch (err) { toast(err.message, "err"); }
+  const primaryName = (files.find((f) => /outline|syllabus/i.test(f.name)) || files[0]).name;
+  let ok = 0, ev = 0, al = 0;
+  for (const f of files) {
+    if (dz) dz.innerHTML = `<b>Reading ${esc(f.name)}…</b> extracting policies & deadlines`;
+    try {
+      const { text, kind } = await extractFile(f);
+      const quiet = files.length > 1 && f.name !== primaryName;
+      const r = await ingestDocument(courseById(courseId), f.name, text, kind, quiet, f);
+      ok++; ev += r.eventsAdded; al += r.allowancesAdded;
+    } catch (err) { toast(`${f.name}: ${err.message}`, "err"); }
+  }
+  if (ok) toast(`Added ${ok} document${ok === 1 ? "" : "s"}: ${ev} deadline${ev === 1 ? "" : "s"}`
+    + (al ? `, ${al} skip tracker${al === 1 ? "" : "s"}` : "") + ".");
   renderCourse(courseId);
 }
 
