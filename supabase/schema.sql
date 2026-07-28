@@ -3,8 +3,9 @@
 
 create extension if not exists pgcrypto;
 
--- Upgrade for databases created before descriptions existed (safe to re-run).
+-- Upgrades for databases created before these columns existed (safe to re-run).
 alter table if exists public.courses add column if not exists description text not null default '';
+alter table if exists public.courses add column if not exists facts_override jsonb not null default '{}';
 
 -- ---------------------------------------------------------------- courses
 create table if not exists public.courses (
@@ -16,6 +17,7 @@ create table if not exists public.courses (
   instructor text not null default '',
   color text not null default '#4f46e5',
   description text not null default '',
+  facts_override jsonb not null default '{}',
   allowances jsonb not null default '[]',
   created_at timestamptz not null default now()
 );

@@ -317,8 +317,18 @@ function extractFactsHeuristic(text) {
 
 /* ---- allowance (skips/drops) detection ---- */
 
-const WORDNUM = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8 };
+const WORDNUM = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10 };
 function toNum(s) { return WORDNUM[String(s).toLowerCase()] || parseInt(s, 10) || 0; }
+const NUMPAT = "\\d+|one|two|three|four|five|six|seven|eight|nine|ten";
+const SUBJPAT = "homework|hw|assignment|problem set|pset|quiz(?:zes)?|quiz|lab|reading|discussion";
+
+function normSubject(s) {
+  const l = String(s || "").toLowerCase();
+  if (/^hw$|^homework$/.test(l)) return "Homework";
+  if (/^pset$|^problem set$/.test(l)) return "Problem set";
+  if (/^quiz/.test(l)) return "Quiz";
+  return cap(l);
+}
 
 function labelEmoji(label) {
   const l = label.toLowerCase();
@@ -335,15 +345,34 @@ function extractAllowancesHeuristic(text) {
   const found = [];
   const add = (label, total) => { if (total >= 1 && total <= 30) found.push({ label, total }); };
   let m;
-  if ((m = text.match(/(\d+|one|two|three|four|five|six)\s+(?:free\s+)?slip days?/i))) add("Slip days", toNum(m[1]));
-  if ((m = text.match(/(\d+|one|two|three|four|five|six)\s+(?:grace|late) days?/i))) add("Late days", toNum(m[1]));
-  if ((m = text.match(/miss (?:up to )?(\d+|one|two|three|four|five|six)\s+(?:lectures?|classes)/i))) add("Class skips", toNum(m[1]));
-  if ((m = text.match(/(\d+|one|two|three|four|five|six)\s+unexcused absences/i))) add("Absences", toNum(m[1]));
-  const dropRe = /(?:(\d+|two|three|four)\s+)?lowest\s+(homework|hw|quiz|problem set|pset|lab)?\s*(?:scores?|grades?)?\s*(?:is|are|will be)?\s*dropped/gi;
-  while ((m = dropRe.exec(text))) {
-    const total = m[1] ? toNum(m[1]) : 1;
-    const subject = m[2] ? cap(m[2].replace(/^hw$/i, "Homework").replace(/^pset$/i, "Problem set")) : "";
-    add(subject ? `${subject} drops` : "Dropped scores", total);
+  if ((m = text.match(new RegExp(`(${NUMPAT})\\s+(?:free\\s+)?slip days?`, "i")))) add("Slip days", toNum(m[1]));
+  if ((m = text.match(new RegExp(`(${NUMPAT})\\s+(?:grace|late) days?`, "i")))) add("Late days", toNum(m[1]));
+  if ((m = text.match(new RegExp(`miss (?:up to )?(${NUMPAT})\\s+(?:lectures?|classes)`, "i")))) add("Class skips", toNum(m[1]));
+  if ((m = text.match(new RegExp(`(${NUMPAT})\\s+(?:unexcused |excused )?absences?(?:\\s+(?:are\\s+)?(?:allowed|permitted))?`, "i")))
+    && /unexcused|excused|allowed|permitted/.test(m[0])) add("Absences", toNum(m[1]));
+  if ((m = text.match(new RegExp(`(${NUMPAT})\\s+free (?:passes|skips|absences)`, "i")))) add("Free passes", toNum(m[1]));
+  if ((m = text.match(new RegExp(`(?:get|have|receive|given|allowed)\\s+(${NUMPAT})\\s+(?:free\\s+)?drops\\b`, "i")))) add("Dropped scores", toNum(m[1]));
+
+  // "5 homework drops", "2 quiz drops"
+  const subjDropRe = new RegExp(`(${NUMPAT})\\s+(${SUBJPAT})\\s+drops?\\b`, "gi");
+  while ((m = subjDropRe.exec(text))) add(`${normSubject(m[2])} drops`, toNum(m[1]));
+
+  // "homework drops: 5"
+  const colonDropRe = new RegExp(`(${SUBJPAT})\\s+drops?\\s*[:=-]\\s*(${NUMPAT})\\b`, "gi");
+  while ((m = colonDropRe.exec(text))) add(`${normSubject(m[1])} drops`, toNum(m[2]));
+
+  // "drop the two lowest quiz scores", "we drop your lowest homework grade"
+  const dropLowRe = new RegExp(`drop(?:s|ped)?\\s+(?:the\\s+|your\\s+)?(${NUMPAT})?\\s*lowest\\s+(${SUBJPAT})?`, "gi");
+  while ((m = dropLowRe.exec(text))) {
+    const subject = m[2] ? normSubject(m[2]) : "";
+    add(subject ? `${subject} drops` : "Dropped scores", m[1] ? toNum(m[1]) : 1);
+  }
+
+  // "two lowest homework scores are dropped"
+  const lowDropRe = new RegExp(`(?:(${NUMPAT})\\s+)?lowest\\s+(${SUBJPAT})?\\s*(?:scores?|grades?)?\\s*(?:is|are|will be)?\\s*dropped`, "gi");
+  while ((m = lowDropRe.exec(text))) {
+    const subject = m[2] ? normSubject(m[2]) : "";
+    add(subject ? `${subject} drops` : "Dropped scores", m[1] ? toNum(m[1]) : 1);
   }
   return found;
 }
@@ -600,21 +629,25 @@ const repo = {
     }
   },
 
-  // Older databases may lack the description column; retry without it once.
+  // Older databases may lack newer columns; retry without whichever one the
+  // error names until the write goes through.
   async _courseWrite(op, payload) {
-    try {
-      return await op(payload);
-    } catch (e) {
-      if (/description/.test(String(e.message)) && "description" in payload) {
-        const { description, ...rest } = payload;
-        return await op(rest);
+    const optional = ["description", "facts_override"];
+    for (let attempt = 0; attempt <= optional.length; attempt++) {
+      try {
+        return await op(payload);
+      } catch (e) {
+        const missing = optional.find((col) => col in payload && String(e.message).includes(col));
+        if (!missing) throw e;
+        payload = { ...payload };
+        delete payload[missing];
+        if (!Object.keys(payload).length) return;
       }
-      throw e;
     }
   },
 
   async addCourse(fields) {
-    const course = { id: uuid(), allowances: [], description: "", ...fields };
+    const course = { id: uuid(), allowances: [], description: "", facts_override: {}, ...fields };
     if (REMOTE) {
       await this._courseWrite((p) => sbThrow(supa.from("courses").insert(p)),
         { ...course, user_id: state.user.id });
@@ -1449,13 +1482,17 @@ function mergeFacts(docs) {
   const merged = { grading: [], tas: [], other_key_policies: [] };
   const keys = ["instructor", "instructor_email", "office_hours", "location_or_modality",
     "late_policy", "attendance_policy", "exam_policy", "academic_integrity", "textbook"];
-  for (const doc of docs) {
+  // Newest upload wins per field; older documents only fill what's still missing.
+  for (const doc of [...docs].reverse()) {
     const f = doc.facts || {};
     for (const k of keys) if (!merged[k] && f[k]) merged[k] = f[k];
     if (!merged.grading.length && Array.isArray(f.grading)) merged.grading = f.grading;
     if (Array.isArray(f.tas)) merged.tas = merged.tas.concat(f.tas);
     if (Array.isArray(f.other_key_policies)) merged.other_key_policies = merged.other_key_policies.concat(f.other_key_policies);
   }
+  merged.tas = merged.tas.filter((t, i, arr) =>
+    arr.findIndex((x) => (x.email || x.name || "") === (t.email || t.name || "")) === i);
+  merged.other_key_policies = [...new Set(merged.other_key_policies)];
   return merged;
 }
 
@@ -1479,6 +1516,16 @@ function renderCourse(courseId) {
   if (facts.tas.length) add("TAs", facts.tas.map((t) => [t.name, t.email].filter(Boolean).join(" · ")).join("\n"));
   add("Integrity", facts.academic_integrity);
   if (facts.other_key_policies.length) add("Worth knowing", facts.other_key_policies.join("\n"));
+
+  // The user's edits sit on top of whatever was extracted: same label replaces
+  // the value (empty hides the row), new labels become extra rows.
+  const baseMap = {};
+  rows.forEach((r) => { baseMap[r.k] = r.v; });
+  const ov = c.facts_override || {};
+  rows.forEach((r) => { if (ov[r.k] !== undefined) r.v = ov[r.k]; });
+  Object.keys(ov).forEach((k) => { if (baseMap[k] === undefined) rows.push({ k, v: ov[k] }); });
+  const shownRows = rows.filter((r) => r.v);
+
   const events = state.db.events.filter((e) => e.course_id === courseId)
     .sort((a, b) => a.date.localeCompare(b.date));
 
@@ -1496,16 +1543,19 @@ function renderCourse(courseId) {
 
     <div class="course-top">
       <div class="card info-card">
-        <h3>Course info</h3>
-        ${rows.length ? `<div class="facts-grid">${rows.map((r) =>
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <h3>Course info</h3>
+          <button class="btn small" id="edit-facts" title="Edit course info">✏️</button>
+        </div>
+        ${shownRows.length ? `<div class="facts-grid">${shownRows.map((r) =>
           `<div class="fact"><div class="k">${esc(r.k)}</div><div class="v">${esc(r.v)}</div></div>`).join("")}</div>`
-        : `<p class="muted">Upload a syllabus and I'll pull out the instructor, grading breakdown, late policy, and more.</p>`}
+        : `<p class="muted">Upload a syllabus and I'll pull out the instructor, grading breakdown, late policy, and more. Or hit ✏️ to fill it in yourself.</p>`}
       </div>
       <div class="card skips-card">
         <div style="display:flex;justify-content:space-between;align-items:center;gap:6px">
           <h3 style="font-size:14px">Skips</h3>
           <span>
-            <button class="btn small" id="auto-allow" title="Scan this course's syllabus and notes for allowed skips, drops, and slip days">✨</button>
+            <button class="btn small" id="auto-allow" title="Scan every syllabus and note in this course and add trackers automatically">✨ Auto add</button>
             <button class="btn small" id="add-allow" title="Add a tracker manually">＋</button>
           </span>
         </div>
@@ -1571,6 +1621,7 @@ function renderCourse(courseId) {
   });
 
   $("#edit-course").addEventListener("click", () => openEditCourse(c));
+  $("#edit-facts").addEventListener("click", () => openEditFacts(c, rows, baseMap));
   const saveAllow = async () => { await repo.saveAllowances(c); renderCourse(courseId); };
   $("#add-allow").addEventListener("click", () => openAddAllowance(c, saveAllow));
   $("#auto-allow").addEventListener("click", async () => {
@@ -1627,15 +1678,27 @@ function renderCourse(courseId) {
 }
 
 async function autoDetectSkips(course) {
-  // Scan every document's full text plus the course notes.
-  const found = [];
+  // Gather everything this course knows: every document's full text plus every note.
+  const texts = [];
   for (const doc of docsOf(course.id)) {
     try {
       const src = await repo.getSource(doc.id);
-      if (src) found.push(...extractAllowancesHeuristic(src.text));
+      if (src) texts.push(src.text);
     } catch (_e) { /* skip unreadable doc */ }
   }
-  for (const note of notesOf(course.id)) found.push(...extractAllowancesHeuristic(note.text));
+  for (const note of notesOf(course.id)) texts.push(note.text);
+  const combined = texts.join("\n\n");
+  let found = extractAllowancesHeuristic(combined);
+  // Signed in with AI: let it read the same pile; its exact numbers win on ties.
+  if (REMOTE && state.user && texts.length) {
+    try {
+      const res = await repo.invokeClaude({ kind: "extract",
+        text: combined.slice(0, 80000), code: course.code, term: course.term || "" });
+      if (res && res.result && Array.isArray(res.result.allowances)) {
+        found = res.result.allowances.concat(found);
+      }
+    } catch (_e) { /* out of AI calls or older function: heuristic already ran */ }
+  }
   const added = mergeAllowances(course, found);
   if (added) await repo.saveAllowances(course);
   return added;
@@ -1668,6 +1731,43 @@ function openEditCourse(course) {
       });
       closeModal(); toast("Course updated.");
       renderCourse(course.id);
+    } catch (err) { toast(err.message, "err"); }
+  });
+}
+
+function openEditFacts(course, rows, baseMap) {
+  openModal(`
+    <h3>Edit course info</h3>
+    <p class="muted" style="margin-top:0">Your edits stick: re-uploading a syllabus never overwrites them. Clear a field to hide that row.</p>
+    ${rows.map((r, i) => `
+      <div class="field"><label>${esc(r.k)}</label><textarea data-ef="${i}" rows="2">${esc(r.v)}</textarea></div>`).join("")}
+    <div class="row">
+      <div class="field"><label>New row name</label><input id="ef-newk" placeholder="Prerequisites"></div>
+      <div class="field"><label>Value</label><input id="ef-newv" placeholder="MATH 1910 or instructor consent"></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" id="ef-reset" title="Throw away your edits and show only what was extracted">Reset to extracted</button>
+      <button class="btn" id="ef-cancel">Cancel</button>
+      <button class="btn primary" id="ef-save">Save</button>
+    </div>`);
+  $("#ef-cancel").addEventListener("click", closeModal);
+  $("#ef-reset").addEventListener("click", async () => {
+    try { await repo.updateCourse(course, { facts_override: {} }); closeModal(); renderCourse(course.id); }
+    catch (err) { toast(err.message, "err"); }
+  });
+  $("#ef-save").addEventListener("click", async () => {
+    const ov = {};
+    rows.forEach((r, i) => {
+      const v = $(`[data-ef="${i}"]`).value.trim().slice(0, 1200);
+      const base = (baseMap[r.k] !== undefined ? String(baseMap[r.k]) : "").trim();
+      if (v !== base) ov[r.k] = v;
+    });
+    const nk = $("#ef-newk").value.trim().slice(0, 60);
+    const nv = $("#ef-newv").value.trim().slice(0, 1200);
+    if (nk && nv) ov[nk] = nv;
+    try {
+      await repo.updateCourse(course, { facts_override: ov });
+      closeModal(); toast("Course info updated."); renderCourse(course.id);
     } catch (err) { toast(err.message, "err"); }
   });
 }
