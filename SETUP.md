@@ -1,4 +1,4 @@
-# MySyllabi server setup (Supabase)
+# SyllabAI server setup (Supabase)
 
 Five steps, all in the Supabase dashboard. Until they're done, the site runs as a
 local demo; after them, it has real accounts powered by one hidden API key.

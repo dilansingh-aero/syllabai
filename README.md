@@ -1,4 +1,4 @@
-# 🎓 MySyllabi
+# 🎓 SyllabAI
 
 **Your syllabi, answered.** Upload every course syllabus once, get a unified deadline
 calendar, and ask questions in plain English — answered *only* from your own materials,

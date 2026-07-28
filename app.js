@@ -1,4 +1,4 @@
-/* MySyllabi — GitHub Pages frontend backed by Supabase.
+/* SyllabAI — GitHub Pages frontend backed by Supabase.
  *
  * Two modes, decided by config.js:
  *   remote: Supabase accounts + Postgres storage. AI answers come from the
@@ -351,11 +351,11 @@ function icsFold(line) {
 
 function generateIcs(events, calName) {
   const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
-  const lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//MySyllabi//Course Calendar//EN",
+  const lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//SyllabAI//Course Calendar//EN",
     "CALSCALE:GREGORIAN", "X-WR-CALNAME:" + icsEscape(calName)];
   for (const ev of events) {
     const ymd = ev.date.replace(/-/g, "");
-    lines.push("BEGIN:VEVENT", `UID:evt-${ev.id}@mysyllabi.local`, `DTSTAMP:${stamp}`);
+    lines.push("BEGIN:VEVENT", `UID:evt-${ev.id}@syllabai.local`, `DTSTAMP:${stamp}`);
     if (ev.time) {
       const hhmm = ev.time.replace(":", "");
       lines.push(`DTSTART:${ymd}T${hhmm}00`);
@@ -1093,7 +1093,7 @@ function renderDashboard() {
   const welcome = !state.db.courses.length ? `
     <div class="card" style="margin-bottom:20px">
       <h3>👋 Welcome</h3>
-      <p style="color:var(--ink-soft)">MySyllabi answers course questions <b>only from syllabi you upload</b>, with quotes to prove it, and tells you whether that email to your professor is even necessary.</p>
+      <p style="color:var(--ink-soft)">SyllabAI answers course questions <b>only from syllabi you upload</b>, with quotes to prove it, and tells you whether that email to your professor is even necessary.</p>
       <button class="btn primary" id="load-demo">🎓 Load 4 demo courses</button>
     </div>` : "";
 
@@ -1851,10 +1851,10 @@ function renderCalendar() {
   $("#add-event").addEventListener("click", openAddEvent);
   $("#import-ics").addEventListener("click", openImportIcs);
   $("#export-ics").addEventListener("click", () => {
-    const blob = new Blob([generateIcs(state.db.events, "MySyllabi")], { type: "text/calendar" });
+    const blob = new Blob([generateIcs(state.db.events, "SyllabAI")], { type: "text/calendar" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    a.download = "mysyllabi.ics";
+    a.download = "syllabai.ics";
     a.click();
     URL.revokeObjectURL(a.href);
     toast("Downloaded. Import it into Google/Apple/Outlook calendar.");
@@ -2040,7 +2040,7 @@ function openFeedback() {
   openModal(`
     <h3>💡 Feedback</h3>
     <p class="muted">Ideas, bugs, feature requests. Goes straight to the developer.</p>
-    <div class="field"><textarea id="fb-text" rows="6" placeholder="What should MySyllabi do better?"></textarea></div>
+    <div class="field"><textarea id="fb-text" rows="6" placeholder="What should SyllabAI do better?"></textarea></div>
     <div class="modal-actions">
       <button class="btn" id="fb-cancel">Cancel</button>
       <button class="btn primary" id="fb-send">Send</button>
@@ -2050,7 +2050,7 @@ function openFeedback() {
     const text = $("#fb-text").value.trim();
     if (text.length < 3) return toast("Write something first.", "err");
     try { await repo.sendFeedback(text); } catch (_e) { /* mailto below still delivers */ }
-    window.open(`mailto:${FEEDBACK_EMAIL}?subject=${encodeURIComponent("MySyllabi feedback")}&body=${encodeURIComponent(text.slice(0, 1500))}`);
+    window.open(`mailto:${FEEDBACK_EMAIL}?subject=${encodeURIComponent("SyllabAI feedback")}&body=${encodeURIComponent(text.slice(0, 1500))}`);
     closeModal();
     toast("Thanks! Sent to the developer (your email app opened too, hit send there to make sure).");
   });

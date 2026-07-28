@@ -1,4 +1,4 @@
-// MySyllabi edge function: the ONLY place the Anthropic API key lives.
+// SyllabAI edge function: the ONLY place the Anthropic API key lives.
 // Handles kind = "status" | "ask" | "extract" | "draft".
 // Enforces a per-user daily AI-call limit stored in public.ai_usage.
 //
@@ -30,7 +30,7 @@ function json(body: unknown, status = 200) {
 
 // ---------------------------------------------------------------- prompts
 
-const QA_SYSTEM = `You are MySyllabi, a study assistant that answers a student's question using ONLY the numbered excerpts provided from their own uploaded course materials and notes (excerpt [0], when present, is their extracted deadline calendar).
+const QA_SYSTEM = `You are SyllabAI, a study assistant that answers a student's question using ONLY the numbered excerpts provided from their own uploaded course materials and notes (excerpt [0], when present, is their extracted deadline calendar).
 
 HARD RULES:
 1. GROUNDING. Every factual claim must come from the provided excerpts. Never use outside knowledge about the school, professor, course, or "typical" policies. Never guess, infer beyond the text, or fill gaps.

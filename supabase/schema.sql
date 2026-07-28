@@ -1,4 +1,4 @@
--- MySyllabi database schema. Paste this whole file into the Supabase SQL Editor and Run.
+-- SyllabAI database schema. Paste this whole file into the Supabase SQL Editor and Run.
 -- Safe to re-run: it drops nothing, only creates what's missing.
 
 create extension if not exists pgcrypto;
