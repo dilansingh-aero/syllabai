@@ -291,3 +291,50 @@ mark.src-hl { background: #ffe25a; color: #1c2130; border-radius: 4px; padding: 
 :root[data-theme="dark"] .toast { background: #343b55; }
 :root[data-theme="dark"] mark.src-hl { background: #eab308; box-shadow: 0 0 0 3px #eab308; }
 :root[data-theme="dark"] .color-dot.sel { border-color: #fff; }
+
+/* ---------- v3: cleaner ask layout ---------- */
+.ask-layout { grid-template-columns: 150px minmax(0, 1fr); }
+.chat-side { gap: 2px; }
+.chat-side .btn.wide { margin-bottom: 6px; }
+.chat-item { background: transparent; border: 1px solid transparent; padding: 6px 9px; }
+.chat-item:hover { background: var(--slate-soft); border-color: transparent; }
+.chat-item.active { background: var(--accent-soft); border-color: transparent; }
+.chat-wrap { max-width: 780px; width: 100%; margin: 0 auto;
+  height: calc(100vh - 215px); min-height: 380px; display: flex; flex-direction: column; gap: 0; }
+.chat-scroll { overflow-y: auto; flex: 1; padding: 4px 8px 14px; }
+.ask-bar { position: static; background: none; padding: 10px 0 0; }
+@media (max-width: 860px) { .chat-wrap { height: auto; min-height: 0; } }
+
+/* ---------- v3: course page top row (info + petite skips) ---------- */
+.course-top { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+.course-top .info-card { flex: 1 1 380px; min-width: 0; }
+.skips-card { flex: 0 1 235px; padding: 13px 15px; }
+.skips-card .allow-row { padding: 4px 0; font-size: 13px; gap: 6px; border-bottom: none; }
+.skips-card .allow-count { min-width: 44px; font-size: 12.5px; }
+.skips-card .btn.small { padding: 1px 8px; font-size: 12px; }
+
+/* ---------- v3: feedback link ---------- */
+.feedback-link { font-size: 12.5px; color: var(--ink-faint); cursor: pointer; }
+.feedback-link:hover { color: var(--accent); }
+
+/* ---------- v3: real document previews ---------- */
+.modal.wide { width: 880px; }
+.doc-view-body.pdf-view { background: #e6e8f0; padding: 16px 10px; }
+:root[data-theme="dark"] .doc-view-body.pdf-view { background: #0d0f18; }
+.pdf-page { position: relative; margin: 0 auto 16px; background: #fff;
+  box-shadow: 0 2px 12px rgba(15, 20, 40, .22); }
+.pdf-page canvas { display: block; }
+.textLayer { position: absolute; inset: 0; overflow: hidden; line-height: 1; }
+.textLayer span, .textLayer br { position: absolute; white-space: pre; transform-origin: 0 0;
+  color: transparent; cursor: text; }
+.textLayer ::selection { background: rgba(79, 70, 229, .32); }
+.textLayer span.pdf-hl { background: rgba(255, 226, 90, .65); border-radius: 2px;
+  box-shadow: 0 0 0 2px rgba(255, 226, 90, .65); }
+.doc-view-body.docx-view { background: var(--bg); }
+.docx-body { background: var(--panel); padding: 28px 34px; border-radius: 10px;
+  max-width: 700px; margin: 0 auto; box-shadow: var(--shadow); font-size: 14px; line-height: 1.6; }
+.docx-body img { max-width: 100%; height: auto; }
+.docx-body table { border-collapse: collapse; margin: 10px 0; max-width: 100%; }
+.docx-body td, .docx-body th { border: 1px solid var(--line); padding: 5px 9px; }
+.docx-body mark.src-hl { animation: hl-pulse 1.6s ease 2; }
+.src-hl-block { background: rgba(255, 226, 90, .3); outline: 3px solid #ffe25a; border-radius: 4px; }

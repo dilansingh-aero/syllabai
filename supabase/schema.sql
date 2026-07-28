@@ -17,8 +17,9 @@ create table if not exists public.courses (
 );
 
 -- ---------------------------------------------------------------- documents
--- text holds the full extracted syllabus; chunks is the pre-chunked jsonb array
--- [{section, text}] used for retrieval so the client never re-parses.
+-- text holds the extracted syllabus text (what the AI reads); chunks is the
+-- pre-chunked jsonb used for retrieval; file_path points at the ORIGINAL
+-- uploaded pdf/docx in the private "documents" storage bucket for previews.
 create table if not exists public.documents (
   id uuid primary key default gen_random_uuid(),
   user_id uuid not null references auth.users(id) on delete cascade,
@@ -29,6 +30,7 @@ create table if not exists public.documents (
   chunks jsonb not null default '[]',
   facts jsonb not null default '{}',
   facts_mode text not null default 'heuristic',
+  file_path text not null default '',
   uploaded_at timestamptz not null default now()
 );
 create index if not exists idx_documents_user on public.documents(user_id);
@@ -79,13 +81,23 @@ create table if not exists public.chats (
 create index if not exists idx_chats_session on public.chats(session_id);
 
 -- ---------------------------------------------------------------- AI usage (daily limits)
--- Clients may READ their own row; only the edge function (service role) writes it,
--- so nobody can reset their own counter.
+-- Clients may READ their own row; only the edge function (service role) writes it.
 create table if not exists public.ai_usage (
   user_id uuid not null references auth.users(id) on delete cascade,
   day date not null,
   calls int not null default 0,
   primary key (user_id, day)
+);
+
+-- ---------------------------------------------------------------- feedback
+-- Users drop ideas here; read them in Table Editor -> feedback. The app also
+-- opens the sender's mail app addressed to the owner.
+create table if not exists public.feedback (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references auth.users(id) on delete set null,
+  email text not null default '',
+  text text not null,
+  created_at timestamptz not null default now()
 );
 
 -- ---------------------------------------------------------------- row level security
@@ -96,6 +108,7 @@ alter table public.events enable row level security;
 alter table public.chat_sessions enable row level security;
 alter table public.chats enable row level security;
 alter table public.ai_usage enable row level security;
+alter table public.feedback enable row level security;
 
 do $$ begin
   create policy "own courses" on public.courses
@@ -130,4 +143,29 @@ exception when duplicate_object then null; end $$;
 do $$ begin
   create policy "read own usage" on public.ai_usage
     for select using (auth.uid() = user_id);
+exception when duplicate_object then null; end $$;
+
+do $$ begin
+  create policy "insert feedback" on public.feedback
+    for insert with check (auth.uid() = user_id);
+exception when duplicate_object then null; end $$;
+
+-- ---------------------------------------------------------------- storage: original files
+-- Private bucket for the uploaded PDFs/Word docs, one folder per user.
+insert into storage.buckets (id, name, public) values ('documents', 'documents', false)
+on conflict (id) do nothing;
+
+do $$ begin
+  create policy "own files select" on storage.objects
+    for select using (bucket_id = 'documents' and auth.uid()::text = (storage.foldername(name))[1]);
+exception when duplicate_object then null; end $$;
+
+do $$ begin
+  create policy "own files insert" on storage.objects
+    for insert with check (bucket_id = 'documents' and auth.uid()::text = (storage.foldername(name))[1]);
+exception when duplicate_object then null; end $$;
+
+do $$ begin
+  create policy "own files delete" on storage.objects
+    for delete using (bucket_id = 'documents' and auth.uid()::text = (storage.foldername(name))[1]);
 exception when duplicate_object then null; end $$;

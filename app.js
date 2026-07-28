@@ -527,7 +527,7 @@ const repo = {
     if (REMOTE) {
       const [courses, docs, events, notes, sessions] = await Promise.all([
         sbThrow(supa.from("courses").select("id, code, title, term, instructor, color, allowances").order("created_at")),
-        sbThrow(supa.from("documents").select("id, course_id, filename, kind, facts, facts_mode, chunks, uploaded_at").order("uploaded_at")),
+        sbThrow(supa.from("documents").select("id, course_id, filename, kind, facts, facts_mode, chunks, file_path, uploaded_at").order("uploaded_at")),
         sbThrow(supa.from("events").select("*").order("date")),
         sbThrow(supa.from("notes").select("id, course_id, text, created_at").order("created_at", { ascending: false })),
         sbThrow(supa.from("chat_sessions").select("*").order("last_at", { ascending: false })),
@@ -563,8 +563,16 @@ const repo = {
     if (!REMOTE) localSave();
   },
 
-  async addDocument(doc) {
+  async addDocument(doc, file) {
     if (REMOTE) {
+      // Keep the ORIGINAL file so the viewer can show the real pdf/docx.
+      if (file && (doc.kind === "pdf" || doc.kind === "docx")) {
+        const ext = doc.kind === "pdf" ? "pdf" : "docx";
+        const path = `${state.user.id}/${doc.id}.${ext}`;
+        const { error } = await supa.storage.from("documents").upload(path, file, { upsert: true });
+        if (!error) doc.file_path = path;
+      }
+      doc.file_path = doc.file_path || "";
       await sbThrow(supa.from("documents").insert({ ...doc, user_id: state.user.id }));
       const { text, ...meta } = doc;
       state.db.docs.push(meta);
@@ -575,7 +583,11 @@ const repo = {
   },
 
   async delDocument(id) {
-    if (REMOTE) await sbThrow(supa.from("documents").delete().eq("id", id));
+    const doc = state.db.docs.find((d) => d.id === id);
+    if (REMOTE) {
+      if (doc && doc.file_path) await supa.storage.from("documents").remove([doc.file_path]).catch(() => {});
+      await sbThrow(supa.from("documents").delete().eq("id", id));
+    }
     state.db.docs = state.db.docs.filter((d) => d.id !== id);
     state.db.events = state.db.events.filter((e) => e.document_id !== id);
     if (!REMOTE) localSave();
@@ -644,22 +656,32 @@ const repo = {
     return doc ? { title: doc.filename, text: doc.text } : null;
   },
 
-  async ensureSession() {
+  // Sessions are only persisted once a first question is asked (no empty rows).
+  findCurrentSession() {
     const marker = chatMarker();
-    const now = Date.now();
-    let session = state.db.sessions.find((s) => s.marker === marker);
-    if (session && now - new Date(session.last_at).getTime() <= SESSION_GAP_MS) {
-      session.last_at = new Date().toISOString();
-      if (REMOTE) await sbThrow(supa.from("chat_sessions").update({ last_at: session.last_at }).eq("id", session.id));
-      else localSave();
-      return session;
-    }
-    if (session) chatMarker(true);
-    session = { id: uuid(), marker: chatMarker(), title: "",
+    const session = state.db.sessions.find((s) => s.marker === marker);
+    if (session && Date.now() - new Date(session.last_at).getTime() <= SESSION_GAP_MS) return session;
+    return null;
+  },
+
+  async persistSession(title) {
+    const session = { id: uuid(), marker: chatMarker(), title: (title || "").slice(0, 60),
       started_at: new Date().toISOString(), last_at: new Date().toISOString() };
     if (REMOTE) await sbThrow(supa.from("chat_sessions").insert({ ...session, user_id: state.user.id }));
     state.db.sessions.unshift(session);
     if (!REMOTE) localSave();
+    return session;
+  },
+
+  // Clicking an old chat makes it the ACTIVE chat again (continue where you left off).
+  async resumeSession(sessionId) {
+    const session = state.db.sessions.find((s) => s.id === sessionId);
+    if (!session) return null;
+    const marker = chatMarker(true);
+    session.marker = marker;
+    session.last_at = new Date().toISOString();
+    if (REMOTE) await sbThrow(supa.from("chat_sessions").update({ marker, last_at: session.last_at }).eq("id", sessionId));
+    else localSave();
     return session;
   },
 
@@ -674,16 +696,22 @@ const repo = {
   async addChat(session, question, answer, courseId) {
     const chat = { id: uuid(), session_id: session.id, course_id: courseId,
       question, answer, created_at: new Date().toISOString() };
+    if (!session.title) session.title = question.slice(0, 60);
+    session.last_at = new Date().toISOString();
     if (REMOTE) {
       await sbThrow(supa.from("chats").insert({ ...chat, user_id: state.user.id }));
-      if (!session.title) await sbThrow(supa.from("chat_sessions").update({ title: question.slice(0, 60) }).eq("id", session.id));
+      await sbThrow(supa.from("chat_sessions").update({ title: session.title, last_at: session.last_at }).eq("id", session.id));
     } else {
       localDb.chats.push(chat);
+      localSave();
     }
-    if (!session.title) session.title = question.slice(0, 60);
-    session.count = (session.count || 0) + 1;
-    if (!REMOTE) localSave();
     return chat;
+  },
+
+  async sendFeedback(text) {
+    if (!REMOTE) return;
+    await sbThrow(supa.from("feedback").insert({ id: uuid(), user_id: state.user.id,
+      email: state.user.email, text: text.slice(0, 4000) }));
   },
 
   async clearChats() {
@@ -869,11 +897,11 @@ Academic Integrity
 Essays are checked for plagiarism and AI generation. Cite everything.` },
 ];
 
-async function ingestDocument(course, filename, text, kind, quiet) {
+async function ingestDocument(course, filename, text, kind, quiet, file) {
   text = text.trim();
   if (text.length < 40) throw new Error("That document looks empty. Nothing to index.");
   const doc = { id: uuid(), course_id: course.id, filename, kind, text,
-    chunks: chunkText(text), facts: null, facts_mode: "heuristic",
+    chunks: chunkText(text), facts: null, facts_mode: "heuristic", file_path: "",
     uploaded_at: new Date().toISOString() };
   let events = [];
   if (REMOTE && state.usage.on && !quiet) {
@@ -891,7 +919,7 @@ async function ingestDocument(course, filename, text, kind, quiet) {
     doc.facts = extractFactsHeuristic(text);
     events = extractEventsHeuristic(text);
   }
-  await repo.addDocument(doc);
+  await repo.addDocument(doc, file);
   const eventsAdded = await repo.addEventsBulk(course.id, doc.id, events, "auto");
   return { doc, eventsAdded };
 }
@@ -969,7 +997,8 @@ async function doAsk(question, courseId, scopeNote) {
       doc_id: ch.doc_id, text: ch.text, score });
   });
 
-  const session = await repo.ensureSession();
+  let session = repo.findCurrentSession();
+  if (!session) session = await repo.persistSession(question);
   let result = null;
   if (REMOTE && state.usage.on) {
     try {
@@ -1076,33 +1105,15 @@ function renderDashboard() {
     </div>
     ${welcome}${upHtml}
     <div class="course-grid">
-      ${state.db.courses.map((c) => {
-        const next = state.db.events.filter((e) => e.course_id === c.id && e.date >= today)
-          .sort((a, b) => a.date.localeCompare(b.date))[0];
-        return `<div class="card course-card" data-id="${c.id}">
+      ${state.db.courses.map((c) => `
+        <div class="card course-card" data-id="${c.id}">
           <div class="stripe" style="background:${esc(c.color)}"></div>
           <h3>${esc(c.code)}</h3><div class="ctitle">${esc(c.title || "")}</div>
-          <div class="cmeta">
-            ${next ? `<span class="chip accent">${KIND_ICONS[next.kind] || "📅"} ${fmtDate(next.date)}</span>` : ""}
-            ${allowanceChips(c)}
-          </div>
-        </div>`;
-      }).join("")}
+        </div>`).join("")}
     </div>
     ${state.db.courses.length === 0 ? `<div class="empty"><div class="big-ic">🎓</div>No courses yet.</div>` : ""}`;
 
   $$(".course-card").forEach((el) => el.addEventListener("click", () => navigate("course", el.dataset.id)));
-  $$(".allow-chip").forEach((chip) => chip.addEventListener("click", async (e) => {
-    e.stopPropagation();
-    const c = courseById(chip.dataset.course);
-    const a = (c.allowances || [])[Number(chip.dataset.idx)];
-    if (!a) return;
-    if (a.remaining <= 0) return toast(`${a.label}: none left in ${c.code}.`, "err");
-    a.remaining--;
-    await repo.saveAllowances(c);
-    toast(`${c.code} ${a.label}: ${a.remaining} of ${a.total} left.`);
-    renderDashboard();
-  }));
   $("#add-course-btn").addEventListener("click", openAddCourse);
   const demoBtn = $("#load-demo");
   if (demoBtn) demoBtn.addEventListener("click", async () => {
@@ -1145,9 +1156,50 @@ function openAddCourse() {
   });
 }
 
-/* ---------- source viewer ---------- */
+/* ---------- source viewer (real pdf/docx previews, text fallback) ---------- */
+
+function viewerShell(title) {
+  openModal(`
+    <div class="doc-view-head">
+      <h3>📄 ${esc(title)}</h3>
+      <button class="btn small" id="dv-close">Close ✕</button>
+    </div>
+    <div class="doc-view-body" id="dv-body"><div class="thinking">Loading document…</div></div>`, true);
+  $("#dv-close").addEventListener("click", closeModal);
+  return $("#dv-body");
+}
+
+function centerIn(bodyEl, el) {
+  let tries = 0;
+  const center = () => {
+    if (!el.isConnected || !bodyEl.isConnected) return;
+    const delta = el.getBoundingClientRect().top - bodyEl.getBoundingClientRect().top;
+    const target = Math.max(0, bodyEl.scrollTop + delta - bodyEl.clientHeight / 2);
+    bodyEl.scrollTop = target;
+    const after = Math.abs(el.getBoundingClientRect().top - bodyEl.getBoundingClientRect().top - bodyEl.clientHeight / 2);
+    if (after > bodyEl.clientHeight && ++tries < 20) setTimeout(center, 120);
+  };
+  setTimeout(center, 60);
+}
 
 async function openDocViewer(docId, quote) {
+  if (String(docId).startsWith("notes-")) return openTextViewer(docId, quote);
+  const doc = state.db.docs.find((d) => d.id === docId);
+  if (doc && REMOTE && doc.file_path && (doc.kind === "pdf" || doc.kind === "docx")) {
+    const body = viewerShell(doc.filename);
+    try {
+      const { data, error } = await supa.storage.from("documents").download(doc.file_path);
+      if (error) throw new Error(error.message);
+      const bytes = await data.arrayBuffer();
+      if (doc.kind === "pdf") await renderPdfPreview(body, bytes, quote);
+      else await renderDocxPreview(body, bytes, quote);
+      return;
+    } catch (_e) { /* fall through to extracted text */ }
+  }
+  return openTextViewer(docId, quote);
+}
+
+async function openTextViewer(docId, quote) {
   let src;
   try { src = await repo.getSource(docId); } catch (err) { return toast(err.message, "err"); }
   if (!src) return toast("That document no longer exists.", "err");
@@ -1162,27 +1214,129 @@ async function openDocViewer(docId, quote) {
         esc(src.text.slice(range[1]));
     }
   }
-  if (!bodyHtml) bodyHtml = esc(src.text);
-  openModal(`
-    <div class="doc-view-head">
-      <h3>📄 ${esc(src.title)}</h3>
-      <button class="btn small" id="dv-close">Close ✕</button>
-    </div>
-    ${quote && !found ? `<p class="muted">Couldn't pinpoint the exact quote, showing the whole document.</p>` : ""}
-    <div class="doc-view-body">${bodyHtml}</div>`, true);
-  $("#dv-close").addEventListener("click", closeModal);
-  if (found) {
-    let tries = 0;
-    const center = () => {
-      const mark = $("#src-hl");
-      const bodyEl = $(".doc-view-body");
-      if (!mark || !bodyEl) return;
-      const target = Math.max(0, mark.offsetTop - bodyEl.clientHeight / 2);
-      bodyEl.scrollTop = target;
-      if (bodyEl.scrollTop < target - 4 && ++tries < 20) setTimeout(center, 100);
-    };
-    setTimeout(center, 50);
+  const body = viewerShell(src.title);
+  body.innerHTML = bodyHtml || esc(src.text);
+  const mark = $("#src-hl");
+  if (found && mark) centerIn(body, mark);
+}
+
+async function renderPdfPreview(body, bytes, quote) {
+  if (!window.pdfjsLib) throw new Error("pdf.js unavailable");
+  pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+  const pdf = await pdfjsLib.getDocument({ data: bytes }).promise;
+  body.innerHTML = "";
+  body.classList.add("pdf-view");
+  const qNorm = quote ? normalizeWs(quote) : "";
+  const dpr = window.devicePixelRatio || 1;
+  let target = null;
+  for (let p = 1; p <= pdf.numPages; p++) {
+    const page = await pdf.getPage(p);
+    const base = page.getViewport({ scale: 1 });
+    const scale = Math.min(1.6, Math.max(0.7, (body.clientWidth - 36) / base.width));
+    const viewport = page.getViewport({ scale });
+    const wrap = document.createElement("div");
+    wrap.className = "pdf-page";
+    wrap.style.width = viewport.width + "px";
+    wrap.style.height = viewport.height + "px";
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.floor(viewport.width * dpr);
+    canvas.height = Math.floor(viewport.height * dpr);
+    canvas.style.width = viewport.width + "px";
+    canvas.style.height = viewport.height + "px";
+    const ctx = canvas.getContext("2d");
+    await page.render({ canvasContext: ctx, viewport,
+      transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : undefined }).promise;
+    wrap.appendChild(canvas);
+    const textDiv = document.createElement("div");
+    textDiv.className = "textLayer";
+    wrap.appendChild(textDiv);
+    body.appendChild(wrap);
+    // Selectable text layer, and the surface the highlight lands on.
+    const textContent = await page.getTextContent();
+    const textDivs = [];
+    try {
+      await pdfjsLib.renderTextLayer({ textContentSource: textContent, textContent,
+        container: textDiv, viewport, textDivs }).promise;
+    } catch (_e) { /* preview still works without a text layer */ }
+    if (qNorm && !target && textDivs.length) {
+      let concat = "";
+      const ranges = [];
+      textContent.items.forEach((it) => {
+        const t = normalizeWs(it.str || "");
+        if (!t) { ranges.push(null); return; }
+        if (concat) concat += " ";
+        const startAt = concat.length;
+        concat += t;
+        ranges.push([startAt, concat.length]);
+      });
+      const at = concat.indexOf(qNorm);
+      if (at >= 0) {
+        const end = at + qNorm.length;
+        textContent.items.forEach((_it, i) => {
+          const r = ranges[i];
+          if (r && r[0] < end && r[1] > at && textDivs[i]) {
+            textDivs[i].classList.add("pdf-hl");
+            if (!target) target = textDivs[i];
+          }
+        });
+      }
+    }
   }
+  if (target) centerIn(body, target);
+}
+
+async function renderDocxPreview(body, bytes, quote) {
+  if (!window.mammoth) throw new Error("mammoth unavailable");
+  const result = await mammoth.convertToHtml({ arrayBuffer: bytes });
+  body.innerHTML = "";
+  body.classList.add("docx-view");
+  const inner = document.createElement("div");
+  inner.className = "docx-body";
+  inner.innerHTML = result.value;
+  body.appendChild(inner);
+  if (quote) {
+    const range = findQuoteRange(inner, quote);
+    if (range) {
+      try {
+        const mark = document.createElement("mark");
+        mark.className = "src-hl";
+        range.surroundContents(mark);
+        centerIn(body, mark);
+        return;
+      } catch (_e) { /* quote spans elements: flash the containing block instead */ }
+      const el = range.startContainer.parentElement;
+      if (el) { el.classList.add("src-hl-block"); centerIn(body, el); }
+    }
+  }
+}
+
+function findQuoteRange(root, quote) {
+  const q = normalizeWs(quote);
+  if (!q) return null;
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  let concat = "";
+  const maps = [];
+  while (walker.nextNode()) {
+    const node = walker.currentNode;
+    const t = node.nodeValue || "";
+    for (let i = 0; i < t.length; i++) {
+      const ch = t[i];
+      if (/\s/.test(ch)) {
+        if (concat && !concat.endsWith(" ")) { concat += " "; maps.push([node, i]); }
+      } else {
+        concat += ch.toLowerCase();
+        maps.push([node, i]);
+      }
+    }
+  }
+  const at = concat.indexOf(q);
+  if (at < 0) return null;
+  const [sn, so] = maps[at];
+  const [en, eo] = maps[at + q.length - 1];
+  const range = document.createRange();
+  range.setStart(sn, so);
+  range.setEnd(en, eo + 1);
+  return range;
 }
 
 /* ---------- course detail ---------- */
@@ -1234,27 +1388,27 @@ function renderCourse(courseId) {
         <button class="btn danger" id="del-course">Delete</button></div>
     </div>
 
-    <div class="card">
-      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
-        <h3>Skips & absences</h3>
-        <button class="btn small" id="add-allow">+ Add a tracker</button>
+    <div class="course-top">
+      <div class="card info-card">
+        <h3>Course info</h3>
+        ${rows.length ? `<div class="facts-grid">${rows.map((r) =>
+          `<div class="fact"><div class="k">${esc(r.k)}</div><div class="v">${esc(r.v)}</div></div>`).join("")}</div>`
+        : `<p class="muted">Upload a syllabus and I'll pull out the instructor, grading breakdown, late policy, and more.</p>`}
       </div>
-      ${(c.allowances || []).length ? c.allowances.map((a, i) => `
-        <div class="allow-row">
-          <span>${esc(a.emoji || "🎟")} <b>${esc(a.label)}</b></span>
-          <span class="spacer"></span>
-          <button class="btn small" data-allow-use="${i}" title="Use one">−</button>
-          <span class="allow-count ${a.remaining === 0 ? "zero" : ""}">${a.remaining}/${a.total} left</span>
-          <button class="btn small" data-allow-undo="${i}" title="Give one back">+</button>
-          <button class="btn small danger" data-allow-del="${i}">✕</button>
-        </div>`).join("") : `<p class="muted">Track allowed skips: "Class skips 3/3" counts down each time you use one.</p>`}
-    </div>
-
-    <div class="card" style="margin-top:16px">
-      <h3>Course info</h3>
-      ${rows.length ? `<div class="facts-grid">${rows.map((r) =>
-        `<div class="fact"><div class="k">${esc(r.k)}</div><div class="v">${esc(r.v)}</div></div>`).join("")}</div>`
-      : `<p class="muted">Upload a syllabus and I'll pull out the instructor, grading breakdown, late policy, and more.</p>`}
+      <div class="card skips-card">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:6px">
+          <h3 style="font-size:14px">Skips</h3>
+          <button class="btn small" id="add-allow" title="Add a tracker">＋</button>
+        </div>
+        ${(c.allowances || []).length ? c.allowances.map((a, i) => `
+          <div class="allow-row">
+            <span title="${esc(a.label)}">${esc(a.emoji || "🎟")}</span>
+            <button class="btn small" data-allow-use="${i}" title="Use one">−</button>
+            <span class="allow-count ${a.remaining === 0 ? "zero" : ""}">${a.remaining}/${a.total}</span>
+            <button class="btn small" data-allow-undo="${i}" title="Give one back">+</button>
+            <button class="btn small danger" data-allow-del="${i}" title="Remove tracker">✕</button>
+          </div>`).join("") : `<p class="muted" style="font-size:12px">Track class, homework, or lab skips. 3/3 counts down as you use them.</p>`}
+      </div>
     </div>
 
     <div class="section-title"><h3>📝 Notes & clues</h3></div>
@@ -1381,7 +1535,7 @@ async function uploadFile(courseId, file) {
   if (dz) dz.innerHTML = `<b>Reading ${esc(file.name)}…</b> extracting policies & deadlines`;
   try {
     const { text, kind } = await extractFile(file);
-    const { doc, eventsAdded } = await ingestDocument(courseById(courseId), file.name, text, kind);
+    const { doc, eventsAdded } = await ingestDocument(courseById(courseId), file.name, text, kind, false, file);
     toast(`Indexed ${doc.chunks.length} sections, added ${eventsAdded} calendar events.`);
   } catch (err) { toast(err.message, "err"); }
   renderCourse(courseId);
@@ -1422,55 +1576,55 @@ function scopeChipsHtml() {
   </div>`;
 }
 
+function scrollChatBottom() {
+  const el = $("#chat-scroll");
+  if (el) el.scrollTop = el.scrollHeight;
+}
+
 async function renderAsk() {
-  const session = await repo.ensureSession();
-  state.currentSessionId = session.id;
-  const displayedId = state.viewingSessionId || state.currentSessionId;
-  const isOld = Boolean(state.viewingSessionId) && state.viewingSessionId !== state.currentSessionId;
+  const current = repo.findCurrentSession();
+  state.currentSessionId = current ? current.id : null;
   let messages = [];
-  try { messages = await repo.listChats(displayedId); } catch (_e) { messages = []; }
-  if (!isOld) state.msgs = messages.map((m) => ({ question: m.question, answer: m.answer, course_id: m.course_id }));
-  const sessions = state.db.sessions.filter((s) => (s.title || "").length || s.id === state.currentSessionId);
+  if (current) { try { messages = await repo.listChats(current.id); } catch (_e) { messages = []; } }
+  state.msgs = messages.map((m) => ({ question: m.question, answer: m.answer, course_id: m.course_id }));
+  const sessions = state.db.sessions.filter((s) => (s.title || "").length);
   const scopedCourse = state.askCourse ? courseById(state.askCourse) : null;
 
   $("#view").innerHTML = `
     <div class="view-head">
       <div><h1>Ask your syllabi</h1>
-      <div class="sub">Answers come only from what you've uploaded, with quotes to prove it. Not in there? I say so.</div></div>
+      <div class="sub">Answers come only from what you've uploaded, with quotes to prove it.</div></div>
       ${REMOTE && state.usage.on ? `<span class="chip" id="ai-counter" title="Resets at midnight UTC">🔋 ${state.usage.left}/${state.usage.limit} AI answers left today</span>` : ""}
     </div>
     <div class="ask-layout">
       <div class="chat-side">
         <button class="btn small wide" id="new-chat">＋ New chat</button>
-        <div class="chat-side-title">Chats</div>
+        <div class="chat-side-title">History</div>
         ${sessions.map((s) => `
-          <div class="chat-item ${s.id === displayedId ? "active" : ""}" data-session="${s.id}">
-            <div class="ci-title">${esc(s.title || "New chat")}</div>
+          <div class="chat-item ${s.id === state.currentSessionId ? "active" : ""}" data-session="${s.id}" title="Open and continue this chat">
+            <div class="ci-title">${esc(s.title)}</div>
             <div class="ci-date">${esc((s.started_at || "").slice(5, 10).replace("-", "/"))}</div>
           </div>`).join("") || `<p class="muted" style="font-size:12px">No chats yet.</p>`}
       </div>
       <div class="chat-wrap">
-        ${isOld ? `<div class="old-banner">Viewing an old chat · <a id="back-current">back to current</a></div>` : ""}
         <div class="chat-scroll" id="chat-scroll">
           ${messages.length ? messages.map((m) => renderExchange(m)).join("") : `
             <div class="empty"><div class="big-ic">💬</div>Try one of these:</div>
             <div class="suggestions" style="justify-content:center">
               ${SUGGESTIONS.map((s) => `<span class="sug">${esc(s)}</span>`).join("")}</div>`}
         </div>
-        ${isOld ? "" : `
         <div class="ask-bar">
           ${scopeChipsHtml()}
           <form class="ask-box" id="ask-form" style="${scopedCourse ? `border-color:${esc(scopedCourse.color)}` : ""}">
             <input id="ask-input" placeholder="${scopedCourse ? `Asking about ${esc(scopedCourse.code)}…` : "Ask across all courses…"}" autocomplete="off">
             <button class="btn primary" id="ask-send" type="submit">Ask</button>
           </form>
-        </div>`}
+        </div>
       </div>
     </div>`;
 
   $$(".sug").forEach((sug) => sug.addEventListener("click", () => { $("#ask-input").value = sug.textContent; submitAsk(); }));
-  const form = $("#ask-form");
-  if (form) form.addEventListener("submit", (e) => { e.preventDefault(); submitAsk(); });
+  $("#ask-form").addEventListener("submit", (e) => { e.preventDefault(); submitAsk(); });
   $$(".scope-chip").forEach((chip) => chip.addEventListener("click", () => {
     state.askCourse = chip.dataset.course;
     const typed = $("#ask-input") ? $("#ask-input").value : "";
@@ -1479,21 +1633,18 @@ async function renderAsk() {
       if (input) { input.value = typed; input.focus(); }
     });
   }));
-  $("#new-chat").addEventListener("click", async () => {
+  $("#new-chat").addEventListener("click", () => {
     chatMarker(true);
-    state.viewingSessionId = null;
     state.msgs = [];
     renderAsk();
   });
-  $$(".chat-item").forEach((item) => item.addEventListener("click", () => {
-    const id = item.dataset.session;
-    state.viewingSessionId = id === state.currentSessionId ? null : id;
+  $$(".chat-item").forEach((item) => item.addEventListener("click", async () => {
+    if (item.dataset.session === state.currentSessionId) return;
+    await repo.resumeSession(item.dataset.session);
     renderAsk();
   }));
-  const back = $("#back-current");
-  if (back) back.addEventListener("click", () => { state.viewingSessionId = null; renderAsk(); });
   bindAnswerActions();
-  window.scrollTo(0, document.body.scrollHeight);
+  scrollChatBottom();
 }
 
 function renderExchange(msg) {
@@ -1567,19 +1718,21 @@ async function submitAsk() {
     `<div class="msg-q">${esc(question)}</div><div class="thinking" id="thinking">Checking your materials…</div>`);
   input.value = "";
   $("#ask-send").disabled = true;
-  window.scrollTo(0, document.body.scrollHeight);
+  scrollChatBottom();
+  const hadSession = state.currentSessionId;
   try {
     const answer = await doAsk(question, courseId, scopeNote);
     $("#thinking").outerHTML = `<div class="msg-a">${renderAnswer(answer, { question, course_id: courseId })}</div>`;
     bindAnswerActions();
     const counter = $("#ai-counter");
     if (counter && state.usage.on) counter.textContent = `🔋 ${state.usage.left}/${state.usage.limit} AI answers left today`;
+    if (hadSession !== state.currentSessionId) renderAsk(); // new chat appeared: refresh the history rail
   } catch (err) {
     $("#thinking").outerHTML = `<div class="msg-a"><div class="answer-card"><span class="pill bad">✕ ${esc(err.message)}</span></div></div>`;
   } finally {
     const send = $("#ask-send");
     if (send) send.disabled = false;
-    window.scrollTo(0, document.body.scrollHeight);
+    scrollChatBottom();
   }
 }
 
@@ -1666,6 +1819,7 @@ function renderCalendar() {
         <button class="btn" id="export-ics">⬇ Export .ics</button>
         <button class="btn primary" id="add-event">+ Event</button></div>
     </div>
+    <p class="muted" style="margin:-8px 0 14px">💡 Canvas users: in Canvas go to Calendar → Calendar Feed, download the .ics file, then hit Import here. Every homework and quiz shows up right on this page.</p>
     <div class="cal-head">
       <button class="btn small" id="cal-prev">←</button><h2>${esc(monthName)}</h2>
       <button class="btn small" id="cal-next">→</button><button class="btn small" id="cal-today">Today</button>
@@ -1877,6 +2031,32 @@ async function enterApp() {
 }
 
 $$("#nav .nav-item").forEach((a) => a.addEventListener("click", () => navigate(a.dataset.view)));
+
+/* ---------- feedback ---------- */
+
+const FEEDBACK_EMAIL = "dilanps2@illinois.edu";
+
+function openFeedback() {
+  openModal(`
+    <h3>💡 Feedback</h3>
+    <p class="muted">Ideas, bugs, feature requests. Goes straight to the developer.</p>
+    <div class="field"><textarea id="fb-text" rows="6" placeholder="What should MySyllabi do better?"></textarea></div>
+    <div class="modal-actions">
+      <button class="btn" id="fb-cancel">Cancel</button>
+      <button class="btn primary" id="fb-send">Send</button>
+    </div>`);
+  $("#fb-cancel").addEventListener("click", closeModal);
+  $("#fb-send").addEventListener("click", async () => {
+    const text = $("#fb-text").value.trim();
+    if (text.length < 3) return toast("Write something first.", "err");
+    try { await repo.sendFeedback(text); } catch (_e) { /* mailto below still delivers */ }
+    window.open(`mailto:${FEEDBACK_EMAIL}?subject=${encodeURIComponent("MySyllabi feedback")}&body=${encodeURIComponent(text.slice(0, 1500))}`);
+    closeModal();
+    toast("Thanks! Sent to the developer (your email app opened too, hit send there to make sure).");
+  });
+}
+const fbLink = $("#feedback-link");
+if (fbLink) fbLink.addEventListener("click", openFeedback);
 
 async function boot() {
   renderAiPill();
