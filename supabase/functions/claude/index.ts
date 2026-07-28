@@ -121,14 +121,16 @@ const FACTS_SCHEMA = {
   },
 };
 
-const SKIPS_SYSTEM = `You hunt through a student's course materials for every countable per-semester allowance the course grants them. Think carefully and read everything: syllabi, policies, and the student's own notes about what the professor said.
+const SKIPS_SYSTEM = `You hunt through a student's course materials for every countable per-semester allowance the course grants them. Think carefully and read everything: syllabi, course outlines, policies, and the student's own notes about what the professor said.
 
-An allowance is ANY finite, numbered budget of forgiveness, of any kind. Common shapes: dropped lowest scores, permitted absences or lecture misses, slip or grace or late days, free quiz misses, homework passes, token systems, revision or resubmission chances, excused skips. Do NOT limit yourself to these examples; if the materials grant a countable number of anything forgivable, include it.
+An allowance is ANY finite, numbered budget of forgiveness, of ANY kind, under ANY name. Dropped lowest scores, permitted absences or misses (lectures, labs, tutorials, discussions, iClicker, attendance), slip or grace or late days, free passes, token systems, revision or resubmission chances, excused skips, anything of that shape. These are examples, not a list to match against: there is no fixed vocabulary. If the materials grant a countable number of anything forgivable, include it, whatever it's called.
+
+The student's notes are informal. Handle typos, shorthand, and odd wording: "5 homewokr skips" means Homework skips 5, "prof said 2 iclicker drops" means iClicker drops 2, "can miss 3 tutes" means Tutorial skips 3. Read for meaning, not exact words.
 
 Rules:
 - Only include allowances with an explicit number actually stated in the materials. "lowest homework dropped" is total 1. "two lowest quiz scores dropped" is total 2. Never infer or assume a number.
-- Penalties are not allowances ("10% off per late day" grants nothing, "after 4 absences you fail" is a threshold, not a grant of 4).
-- label: short and student-facing ("Homework drops", "Slip days", "Class skips", "Late tokens").
+- Penalties and thresholds are not allowances ("10% off per late day" grants nothing, "after 4 absences you fail" is a threshold, not a grant of 4).
+- label: short, student-facing, correctly spelled even when the source has typos ("Homework skips", "Slip days", "iClicker drops", "Late tokens").
 - One entry per distinct allowance. [] if none.`;
 
 const SKIPS_SCHEMA = {

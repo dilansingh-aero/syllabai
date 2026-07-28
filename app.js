@@ -355,13 +355,14 @@ function extractAllowancesHeuristic(text) {
   if ((m = text.match(new RegExp(`(${NUMPAT})\\s+free (?:passes|skips|absences)`, "i")))) add("Free passes", toNum(m[1]));
   if ((m = text.match(new RegExp(`(?:get|have|receive|given|allowed)\\s+(${NUMPAT})\\s+(?:free\\s+)?drops\\b`, "i")))) add("Dropped scores", toNum(m[1]));
 
-  // "5 homework drops", "2 quiz drops"
-  const subjDropRe = new RegExp(`(${NUMPAT})\\s+(${SUBJPAT})\\s+drops?\\b`, "gi");
-  while ((m = subjDropRe.exec(text))) add(`${normSubject(m[2])} drops`, toNum(m[1]));
+  // "5 homework drops", "2 quiz skips", "3 lab passes"
+  const nounOf = (w) => /skip|miss/i.test(w) ? "skips" : /pass/i.test(w) ? "passes" : "drops";
+  const subjDropRe = new RegExp(`(${NUMPAT})\\s+(${SUBJPAT})\\s+(drops?|skips?|passes|misses)\\b`, "gi");
+  while ((m = subjDropRe.exec(text))) add(`${normSubject(m[2])} ${nounOf(m[3])}`, toNum(m[1]));
 
-  // "homework drops: 5"
-  const colonDropRe = new RegExp(`(${SUBJPAT})\\s+drops?\\s*[:=-]\\s*(${NUMPAT})\\b`, "gi");
-  while ((m = colonDropRe.exec(text))) add(`${normSubject(m[1])} drops`, toNum(m[2]));
+  // "homework drops: 5", "quiz skips = 2"
+  const colonDropRe = new RegExp(`(${SUBJPAT})\\s+(drops?|skips?|passes)\\s*[:=-]\\s*(${NUMPAT})\\b`, "gi");
+  while ((m = colonDropRe.exec(text))) add(`${normSubject(m[1])} ${nounOf(m[2])}`, toNum(m[3]));
 
   // "drop the two lowest quiz scores", "we drop your lowest homework grade"
   const dropLowRe = new RegExp(`drop(?:s|ped)?\\s+(?:the\\s+|your\\s+)?(${NUMPAT})?\\s*lowest\\s+(${SUBJPAT})?`, "gi");
@@ -1921,9 +1922,14 @@ function renderCourse(courseId) {
     const btn = $("#auto-allow");
     btn.disabled = true;
     try {
-      const added = await autoDetectSkips(c);
-      toast(added ? `Found ${added} tracker${added === 1 ? "" : "s"} in your materials.`
-        : "No countable skips, drops, or slip days found in this course's materials.");
+      const { added, aiOk, hadText } = await autoDetectSkips(c);
+      if (!hadText) toast("Nothing to scan yet. Upload a syllabus or add a note first.", "err");
+      else if (aiOk) toast(added ? `AI read everything and set up ${added} tracker${added === 1 ? "" : "s"}.`
+        : "AI read everything: no countable skips, drops, or allowances stated.");
+      else if (REMOTE) toast(added ? `Basic scan found ${added} tracker${added === 1 ? "" : "s"}. The full AI scan needs the updated edge function deployed (SETUP.md).`
+        : "Basic scan found nothing. The full AI scan (handles typos and any wording) needs the updated edge function deployed, or you're out of AI calls today.", added ? "" : "err");
+      else toast(added ? `Found ${added} tracker${added === 1 ? "" : "s"}.`
+        : "No countable skips or drops matched. Demo mode uses patterns only; the live site's AI scan reads anything.");
     } catch (err) { toast(err.message, "err"); }
     renderCourse(courseId);
   });
@@ -1983,20 +1989,22 @@ async function autoDetectSkips(course) {
   const combined = texts.join("\n\n");
   let found = extractAllowancesHeuristic(combined);
   // Signed in with AI: a dedicated cheap-model pass reads the same pile with an
-  // open-ended brief (any countable allowance, not a fixed list). Its exact
-  // numbers win on label ties.
+  // open-ended brief (any countable allowance, any wording, typos included).
+  // Its results lead; the pattern scan is only the offline backup.
+  let aiOk = false;
   if (REMOTE && state.user && texts.length) {
     try {
       const res = await repo.invokeClaude({ kind: "skips",
         text: combined.slice(0, 80000), code: course.code });
       if (res && res.result && Array.isArray(res.result.allowances)) {
         found = res.result.allowances.concat(found);
+        aiOk = true;
       }
     } catch (_e) { /* out of AI calls or older function: heuristic already ran */ }
   }
   const added = mergeAllowances(course, found);
   if (added) await repo.saveAllowances(course);
-  return added;
+  return { added, aiOk, hadText: texts.length > 0 };
 }
 
 function openEditCourse(course) {
